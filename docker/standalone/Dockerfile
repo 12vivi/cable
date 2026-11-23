@@ -1,0 +1,45 @@
+FROM node:22-bookworm-slim AS node
+FROM python:3.12-slim-bookworm AS source
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates && rm -rf /var/lib/apt/lists/*
+ARG CABLE_REVISION
+WORKDIR /source
+RUN git init && git remote add origin https://github.com/12vivi/cable.git \
+    && git fetch --depth=1 origin "${CABLE_REVISION}" && git checkout --detach FETCH_HEAD
+
+FROM python:3.12-slim-bookworm AS build
+COPY --from=node /usr/local /usr/local
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates && rm -rf /var/lib/apt/lists/*
+# 只按锁文件和 SDK 内容建立依赖层；改 README 或业务源码时无需重装依赖。
+COPY --from=source /source/docker/host-runtime/requirements.lock /tmp/requirements.lock
+COPY --from=source /source/sdk/python /tmp/sdk
+RUN python -m venv /opt/venv \
+    && /opt/venv/bin/pip install --no-cache-dir --require-hashes -r /tmp/requirements.lock \
+    && /opt/venv/bin/pip install --no-cache-dir --no-deps /tmp/sdk
+COPY --from=source /source /source
+WORKDIR /source
+RUN /opt/venv/bin/python scripts/build_plugin_distribution.py --revision HEAD --output /opt/distribution \
+    && /opt/venv/bin/python scripts/distribution_runtime.py prepare-wheels --distribution /opt/distribution \
+    && /opt/venv/bin/python -c "from pathlib import Path; from scripts.install_plugin_distribution import extract_core; extract_core(Path('/opt/distribution'), Path('/opt/core'))"
+
+FROM python:3.12-slim-bookworm
+ARG CABLE_REVISION
+LABEL org.opencontainers.image.source="https://github.com/12vivi/cable" \
+      org.opencontainers.image.revision=$CABLE_REVISION
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates zsh curl libstdc++6 libatomic1 \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid 1000 cable && useradd --uid 1000 --gid 1000 --create-home cable \
+    && mkdir /data && chown cable:cable /data
+COPY --from=node /usr/local/bin/node /usr/local/bin/node
+COPY --from=build /opt/venv /opt/venv
+COPY --from=build /opt/distribution /opt/distribution
+COPY --from=build /opt/core /opt/core
+# 插件源码保留临时目录的 700 权限；运行用户需要读取，但不应改写镜像制品。
+RUN chmod -R a=rX /opt/distribution && /usr/local/bin/node --version
+# 限制 glibc arena 数量，避免后台线程的大块临时分配把 RSS 撑到 线程数 × 峰值（#1455）。
+ENV MALLOC_ARENA_MAX=2
+ENV PATH=/opt/venv/bin:$PATH CABLE_EXECUTION_MODE=local PYTHONUNBUFFERED=1 CABLE_PLUGIN_DISTRIBUTION=/opt/distribution \
+    CABLE_WORKSPACE=/data/workspace CABLE_PLUGIN_HOME=/data/plugin-home
+USER cable
+WORKDIR /opt/core
+EXPOSE 2236
+ENTRYPOINT ["python", "scripts/start.py", "--distribution", "/opt/distribution", "--state", "/data", "--no-browser"]

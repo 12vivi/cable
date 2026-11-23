@@ -1,0 +1,21 @@
+[Unit]
+Description=Cable Host Bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=huashen
+Group=huashen
+EnvironmentFile=%h/.config/cable-container/runtime.env
+Environment=CABLE_LOG_FORMAT=json
+Environment=CABLE_SERVICE_NAME=cable-host-bridge
+ExecStartPre=/usr/bin/env ${CABLE_BRIDGE_PYTHON} ${CABLE_RUNTIME_CHECKOUT}/scripts/verify_host_runtime_deployment.py --host-only --release-manifest ${CABLE_RELEASE_MANIFEST} --runtime-checkout ${CABLE_RUNTIME_CHECKOUT} --mise ${CABLE_MISE} --bridge-python ${CABLE_BRIDGE_PYTHON} --expected-toolchain-digest ${CABLE_HOST_TOOLCHAIN_DIGEST}
+ExecStart=/usr/bin/env ${CABLE_MISE} exec -C ${CABLE_RUNTIME_CHECKOUT} -- /usr/bin/env PYTHONPATH=${CABLE_RUNTIME_CHECKOUT} ${CABLE_BRIDGE_PYTHON} -m plugins.host_execution.bridge.server --socket ${CABLE_HOST_BRIDGE_SOCKET} --token-file ${CABLE_HOST_BRIDGE_TOKEN_FILE} --lease-timeout 305 --artifact-root ${CABLE_HOST_ARTIFACT_ROOT} --release-commit ${CABLE_RUNTIME_COMMIT} --toolchain-digest ${CABLE_HOST_TOOLCHAIN_DIGEST} --runtime-checkout ${CABLE_RUNTIME_CHECKOUT} --bridge-python ${CABLE_BRIDGE_PYTHON}
+Restart=on-failure
+RestartSec=3s
+KillMode=control-group
+TimeoutStopSec=30s
+
+[Install]
+WantedBy=multi-user.target

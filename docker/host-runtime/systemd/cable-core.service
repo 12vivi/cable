@@ -1,0 +1,28 @@
+[Unit]
+Description=Cable Core container
+Requires=cable-host-bridge.service
+Requires=docker.service
+After=docker.service cable-host-bridge.service
+PartOf=cable-host-bridge.service
+StartLimitIntervalSec=120
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=huashen
+Group=huashen
+SupplementaryGroups=docker
+EnvironmentFile=%h/.config/cable-container/runtime.env
+# 宿主工具链由 Requires/PartOf 的 Host Bridge 启动前核对；这里只核对镜像身份。
+ExecStartPre=/usr/bin/env ${CABLE_BRIDGE_PYTHON} ${CABLE_RUNTIME_CHECKOUT}/scripts/verify_host_runtime_deployment.py --image-only --release-manifest ${CABLE_RELEASE_MANIFEST} --image ${CABLE_IMAGE}
+ExecStart=/usr/bin/docker compose --project-name cable-core --file ${CABLE_RUNTIME_CHECKOUT}/docker/host-runtime/compose.experiment.yaml --file ${CABLE_RUNTIME_CHECKOUT}/docker/host-runtime/compose.external-services.yaml up --no-color --abort-on-container-exit --exit-code-from cable-core cable-core workload-controller
+ExecStop=/usr/bin/docker compose --project-name cable-core --file ${CABLE_RUNTIME_CHECKOUT}/docker/host-runtime/compose.experiment.yaml --file ${CABLE_RUNTIME_CHECKOUT}/docker/host-runtime/compose.external-services.yaml stop --timeout 60 cable-core workload-controller
+# Compose 收尾也属于正常退出；不要在容器已停止后立即向它发送第二次信号。
+ExecStop=/bin/sh -c 'test -z "$$MAINPID" || exec /usr/bin/tail --pid="$$MAINPID" -f /dev/null'
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=180s
+TimeoutStopSec=90s
+
+[Install]
+WantedBy=multi-user.target

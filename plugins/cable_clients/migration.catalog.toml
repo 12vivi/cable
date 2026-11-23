@@ -1,0 +1,17 @@
+schema_version = 2
+bundle_id = "cable_clients_config"
+version = "1.0.1"
+migration_root = "migrations/cable_clients_migrations"
+package_name = "cable_clients_migrations"
+
+[[migrations]]
+id = "20260913_01_cable_clients_config"
+path = "20260913_01_cable_clients_config.py"
+depends = []
+transactional = false
+
+[[migrations]]
+id = "20260928_01_retire_mobile_config"
+path = "20260928_01_retire_mobile_config.py"
+depends = ["20260913_01_cable_clients_config"]
+transactional = false

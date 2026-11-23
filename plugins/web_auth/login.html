@@ -1,0 +1,194 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="referrer" content="no-referrer">
+<title>登录 · Cable</title>
+<style>
+:root { --paper: #f5f4ed; --field: #faf9f5; --ink: #141413; --ink-2: #504e49; --ink-3: #6b6a64; --rule: rgb(20 20 19 / .22); --accent: #1b365d; --accent-ink: #faf9f5; --accent-soft: rgb(27 54 93 / .08); --bad: #8c2c24; }
+@media (prefers-color-scheme: dark) { :root { --paper: #181816; --field: #1e1e1b; --ink: #ecebe4; --ink-2: #bab8af; --ink-3: #929088; --rule: rgb(236 235 228 / .26); --accent: #96b4e2; --accent-ink: #12161e; --accent-soft: rgb(150 180 226 / .12); --bad: #e48c80; color-scheme: dark; } }
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+body { margin: 0; min-height: 100dvh; display: grid; place-items: center; padding: 24px max(16px, env(safe-area-inset-right, 0px)) 24px max(16px, env(safe-area-inset-left, 0px)); background: var(--paper); color: var(--ink); font: 16px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Noto Sans SC", "Microsoft YaHei", sans-serif; }
+form, .booting { width: min(100%, 340px); min-width: 0; display: grid; gap: 14px; }
+form > * { min-width: 0; }
+.brand { font-weight: 700; display: flex; gap: 8px; align-items: center; }
+.brand i { width: 18px; height: 18px; border-radius: 5px; background: var(--ink); }
+h1 { margin: 4px 0 0; font-size: 26px; line-height: 1.2; }
+p { margin: 0; color: var(--ink-2); font-size: 14px; }
+label { display: grid; gap: 6px; font-size: 13px; color: var(--ink-2); }
+input[type=text], input[type=password] { width: 100%; min-width: 0; min-height: 44px; padding: 0 12px; border: 1px solid var(--rule); border-radius: 9px; background: var(--field); color: inherit; font: inherit; }
+input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.check { display: flex; min-height: 44px; gap: 10px; align-items: flex-start; padding-block: 4px; font-size: 14px; cursor: pointer; }
+.check input { width: 18px; height: 18px; flex: 0 0 auto; margin-top: 2px; accent-color: var(--accent); }
+.check small { display: block; color: var(--ink-3); font-size: 12px; }
+button { min-height: 46px; border: 0; border-radius: 10px; background: var(--accent); color: var(--accent-ink); font: inherit; font-weight: 600; cursor: pointer; }
+button:disabled { opacity: .45; cursor: progress; }
+.msg { min-height: 20px; font-size: 13px; color: var(--bad); }
+details { min-width: 0; max-width: 100%; border-top: 1px solid var(--rule); padding-top: 6px; font-size: 13px; color: var(--ink-2); }
+summary { display: flex; min-height: 44px; align-items: center; gap: 6px; list-style: none; cursor: pointer; color: var(--accent); font-size: 14px; }
+summary::-webkit-details-marker { display: none; }
+summary::before { content: "▸"; display: inline-grid; place-items: center; width: 14px; height: 14px; font-size: 13px; line-height: 1; translate: 0 -0.5px; transition: transform 150ms ease; }
+details[open] > summary::before { transform: rotate(90deg); }
+pre { margin: 8px 0; max-width: 100%; padding: 8px 10px; border-radius: 7px; background: var(--accent-soft); font: 12px/1.6 ui-monospace, Menlo, monospace; overflow-x: auto; }
+</style>
+</head>
+<body data-initial="login">
+<div id="booting" class="booting" role="status" hidden>
+  <div class="brand"><i></i>Cable</div>
+  <p id="booting-text">正在验证登录状态…</p>
+</div>
+<form id="login" hidden>
+  <div class="brand"><i></i>Cable</div>
+  <h1>登录</h1>
+  <p id="hint">这台 Cable 只对主人开放。</p>
+  <label>用户名<input id="username" type="text" autocomplete="username" value="cable" spellcheck="false" required></label>
+  <label>密码<input id="password" type="password" autocomplete="current-password" required autofocus></label>
+  <label class="check"><input id="remember" type="checkbox" checked><span>记住这台设备<small>90 天内免登录。在别人的电脑上请取消勾选。</small></span></label>
+  <button type="submit">登录</button>
+  <div class="msg" role="alert"></div>
+  <details>
+    <summary>第一次使用或忘记密码？</summary>
+    <p>第一次使用时，初始密码在启动日志里。也可以在服务器上运行下面的命令，免密进入或重置：</p>
+    <pre>python main.py web-login      # 打印一次性登录链接
+python main.py web-passwd     # 重置为临时密码，所有设备退出
+docker compose exec cable python main.py web-login</pre>
+    <p>也可以在 Telegram/QQ 里让 Cable 帮你重置网页密码。</p>
+  </details>
+</form>
+<form id="change" hidden>
+  <div class="brand"><i></i>Cable</div>
+  <h1>设置你自己的密码</h1>
+  <p>初始或临时密码出现在日志或聊天里，保存新密码后就会失效。以后在任何设备上都用这个密码登录。</p>
+  <input type="text" autocomplete="username" value="cable" hidden>
+  <label>新密码<input id="new1" type="password" autocomplete="new-password" minlength="10" required></label>
+  <label>再输入一次<input id="new2" type="password" autocomplete="new-password" required></label>
+  <p>至少 10 个字符。不要求大小写或符号，长一点比复杂更有用。</p>
+  <button type="submit">保存并进入</button>
+  <div class="msg" role="alert"></div>
+</form>
+<script>
+function safeNext(candidate) {
+  const fallback = new URL("/", location.origin).href;
+  if (!candidate || typeof candidate !== "string") return fallback;
+  if (!candidate.startsWith("/") || candidate.startsWith("//")) return fallback;
+  if (/[\u0000-\u001f\u007f\\]/.test(candidate)) return fallback;
+  try {
+    const parsed = new URL(candidate, location.origin);
+    if (parsed.origin !== location.origin) return fallback;
+    const decoded = decodeURIComponent(parsed.pathname);
+    if (parsed.pathname.startsWith("//") || decoded.startsWith("//")) return fallback;
+    if (parsed.pathname === "/_auth" || parsed.pathname.startsWith("/_auth/")
+      || decoded === "/_auth" || decoded.startsWith("/_auth/")) return fallback;
+    const relative = `${parsed.pathname}${parsed.search}${parsed.hash}` || "/";
+    const rechecked = new URL(relative, location.origin);
+    if (rechecked.origin !== location.origin || rechecked.pathname.startsWith("//")) return fallback;
+    return rechecked.href;
+  } catch {
+    return fallback;
+  }
+}
+
+const next = safeNext(new URLSearchParams(location.search).get("next"));
+
+async function post(path, body) {
+  const response = await fetch(path, { method: "POST", headers: { "content-type": "application/json" },
+                                       body: JSON.stringify(body), credentials: "same-origin" });
+  return [response.status, await response.json().catch(() => ({}))];
+}
+
+function show(id, message = "") {
+  document.getElementById("booting").hidden = true;
+  for (const form of document.forms) form.hidden = form.id !== id;
+  document.querySelector(`#${id} .msg`).textContent = message;
+  document.querySelector(`#${id} input:not([hidden])${id === "login" ? "#password" : ""}`).focus();
+}
+
+function showBooting(text) {
+  for (const form of document.forms) form.hidden = true;
+  const booting = document.getElementById("booting");
+  document.getElementById("booting-text").textContent = text;
+  booting.hidden = false;
+}
+
+async function boot() {
+  // 1. 本机命令签发的票据只在 # 后，浏览器不会把它发给任何代理；读到后立即从地址栏移除。
+  if (location.hash.startsWith("#t=")) {
+    showBooting("正在验证一次性登录链接…");
+    const ticket = location.hash.slice(3);
+    history.replaceState(null, "", location.pathname + location.search);
+    const [status, body] = await post("/_auth/ticket", { ticket });
+    if (status === 200) {
+      if (body.mustChange) return show("change");
+      showBooting("正在进入 Cable…");
+      return location.replace(next);
+    }
+    return show("login", "这条登录链接已失效或已使用。请重新运行 web-login，或用密码登录。");
+  }
+  const initial = document.body.dataset.initial;
+  if (initial === "signed_in") {
+    showBooting("正在进入 Cable…");
+    return location.replace(next);
+  }
+  if (initial === "change" || initial === "login") return show(initial);
+  showBooting("正在检查登录状态…");
+  const state = await (await fetch("/_auth/state", { credentials: "same-origin" })).json();
+  if (state.signedIn && !state.mustChange) return location.replace(next);
+  show(state.signedIn ? "change" : "login");
+}
+
+document.getElementById("login").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const form = event.currentTarget, button = form.querySelector("button");
+  button.disabled = true;
+  button.textContent = "正在登录…";
+  try {
+    const [status, body] = await post("/_auth/login", { username: form.username.value.trim(),
+      password: form.password.value, remember: form.remember.checked });
+    if (status === 200) {
+      if (body.mustChange) {
+        button.disabled = false;
+        button.textContent = "登录";
+        return show("change");
+      }
+      button.textContent = "正在进入…";
+      return location.replace(next);
+    }
+    button.disabled = false;
+    button.textContent = "登录";
+    form.password.value = "";
+    show("login", status === 429 ? `尝试次数过多，请 ${body.retryAfter} 秒后再试。` : "用户名或密码不对。");
+  } catch {
+    button.disabled = false;
+    button.textContent = "登录";
+    show("login", "网络异常，请检查连接后再试。");
+  }
+});
+
+document.getElementById("change").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const form = event.currentTarget, button = form.querySelector("button");
+  if (form.new1.value !== form.new2.value) return show("change", "两次输入不一致。");
+  button.disabled = true;
+  button.textContent = "正在保存…";
+  try {
+    const [status, body] = await post("/_auth/password", { password: form.new1.value });
+    if (status === 200) {
+      button.textContent = "正在进入…";
+      return location.replace(next);
+    }
+    button.disabled = false;
+    button.textContent = "保存并进入";
+    show(status === 401 ? "login" : "change", body.message || "登录已失效，请重新登录。");
+  } catch {
+    button.disabled = false;
+    button.textContent = "保存并进入";
+    show("change", "网络异常，请检查连接后再试。");
+  }
+});
+
+boot().catch(() => show("login", "无法连接 Cable，请稍后刷新。"));
+</script>
+</body>
+</html>

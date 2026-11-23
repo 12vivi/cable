@@ -1,0 +1,598 @@
+import { EventEmitter, once } from "node:events";
+import { randomInt } from "node:crypto";
+
+// 导航由参考实现自己的等待与 stopLoading 收尾掌管；CDP 层只兜底，不能抢先以 10 秒超时打断。
+const NAVIGATE_CEILING_MS = 120_000;
+// 把页面行为交给 Agent 处理的拦截，以及关掉它的命令；关掉后 Chromium 恢复原生行为、放行已暂停的响应。
+const INTERCEPTIONS = new Map([
+  ["Fetch.enable", ["Fetch.disable", {}]],
+  ["Fetch.disable", ["Fetch.disable", {}]],
+  ["Page.setInterceptFileChooserDialog", ["Page.setInterceptFileChooserDialog", { enabled: false }]],
+  ["Input.setInterceptDrags", ["Input.setInterceptDrags", { enabled: false }]],
+]);
+
+/** 每个 WebSocket 拥有自己的请求表；断连同时拒绝全部等待者。 */
+class CdpConnection extends EventEmitter {
+  pending = new Map();
+  nextId = 1;
+  async open(url) {
+    this.socket = new WebSocket(url);
+    this.socket.addEventListener("message", ({ data }) => {
+      const message = JSON.parse(data);
+      if (message.id != null) {
+        const pending = this.pending.get(message.id);
+        if (!pending) return;
+        this.pending.delete(message.id);
+        clearTimeout(pending.timer);
+        if (message.error) pending.reject(new Error(message.error.message));
+        else pending.resolve(message.result);
+      } else this.emit("event", message);
+    });
+    this.socket.addEventListener("close", () => {
+      for (const pending of this.pending.values()) {
+        clearTimeout(pending.timer);
+        pending.reject(
+          new Error("Chromium connection closed; earlier effects may remain"),
+        );
+      }
+      this.pending.clear();
+      this.emit("close");
+    });
+    await Promise.race([
+      once(this.socket, "open"),
+      new Promise((_, reject) => {
+        const timer = setTimeout(() => {
+          this.socket.close();
+          reject(new Error("Chromium connection timed out"));
+        }, 5000);
+        this.socket.addEventListener("open", () => clearTimeout(timer), {
+          once: true,
+        });
+        this.socket.addEventListener(
+          "error",
+          () => {
+            clearTimeout(timer);
+            reject(new Error("Chromium connection failed"));
+          },
+          { once: true },
+        );
+      }),
+    ]);
+    return this;
+  }
+  send(method, params = {}, sessionId, timeoutMs = 10_000) {
+    if (this.socket.readyState !== WebSocket.OPEN)
+      return Promise.reject(new Error("Chromium connection is closed"));
+    const id = this.nextId++;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        reject(new Error(`CDP timeout: ${method}; effects may remain`));
+      }, timeoutMs);
+      this.pending.set(id, { resolve, reject, timer });
+      this.socket.send(
+        JSON.stringify({
+          id,
+          method,
+          params,
+          ...(sessionId ? { sessionId } : {}),
+        }),
+      );
+    });
+  }
+  close() {
+    this.socket.close();
+  }
+}
+
+export const SPACE_SENTINEL_URL = "about:blank#cable-space";
+
+/** 每个标签都是同一块屏幕上的窗口：新窗口铺满屏幕，观看者正在看的窗口始终留在最前。 */
+export class Screen {
+  front = null;
+  // 全屏会把窗口提到最前；随后立即把观看者的窗口提回来，Agent 开标签不切走画面。
+  async place(connection, targetId) {
+    const { windowId } = await connection.send("Browser.getWindowForTarget", { targetId });
+    await connection.send("Browser.setWindowBounds", { windowId, bounds: { windowState: "fullscreen" } });
+    if (this.front && this.front !== targetId)
+      await connection.send("Target.activateTarget", { targetId: this.front }).catch(() => { this.front = null; });
+  }
+  async show(connection, targetId) {
+    await connection.send("Target.activateTarget", { targetId });
+    this.front = targetId;
+  }
+  async restoreFront(connection) {
+    if (!this.front) return;
+    await connection.send("Target.activateTarget", { targetId: this.front }).catch(() => {});
+  }
+}
+
+/** 每个后端绑定一个浏览器端点，并可限制为一个匿名 Context；主后端排除全部匿名 Context。 */
+export class BrowserBackend extends EventEmitter {
+  constructor(
+    url = "http://127.0.0.1:9222",
+    name = "Cable Chromium",
+    browserContextId = null,
+    excluded = new Set(),
+    screen = new Screen(),
+  ) {
+    super();
+    this.url = url;
+    this.name = name;
+    this.browserContextId = browserContextId;
+    this.excluded = excluded;
+    this.screen = screen;
+  }
+  tabs = new Map();
+  connections = new Map();
+  connecting = new Map();
+  nextTab = randomInt(1, 2 ** 40);
+  inputs = new Map();
+  expressions = new Map();
+  sessionNames = new Map();
+  interceptions = new Map();
+  intercepting = true;
+  hiddenTargets = new Set();
+  hiddenTargetRoots = new Map();
+  creatingInternalTargets = 0;
+  async start() {
+    const response = await fetch(`${this.url}/json/version`, {
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!response.ok)
+      throw new Error(`Chromium discovery returned ${response.status}`);
+    const { webSocketDebuggerUrl } = await response.json();
+    this.browser = await new CdpConnection().open(webSocketDebuggerUrl);
+    this.browser.on("close", () => this.emit("disconnected"));
+  }
+  async listTabs() {
+    const { targetInfos } = await this.browser.send("Target.getTargets");
+    const live = new Set();
+    const results = [];
+    for (const target of targetInfos.filter(
+      (item) =>
+        item.type === "page" &&
+        !this.hiddenTargets.has(item.targetId) &&
+        item.url !== SPACE_SENTINEL_URL &&
+        (this.browserContextId
+          ? item.browserContextId === this.browserContextId
+          : !this.excluded.has(item.browserContextId)),
+    )) {
+      live.add(target.targetId);
+      let tab = this.tabs.get(target.targetId);
+      if (!tab) {
+        tab = {
+          id: this.nextTab++,
+          targetId: target.targetId,
+          created: null,
+          claimed: null,
+          status: null,
+        };
+        this.tabs.set(target.targetId, tab);
+      }
+      Object.assign(tab, { url: target.url, title: target.title });
+      const { windowId } = await this.browser.send(
+        "Browser.getWindowForTarget",
+        { targetId: target.targetId },
+      );
+      results.push({
+        id: tab.id,
+        title: tab.title,
+        url: tab.url,
+        windowId,
+      });
+    }
+    for (const [id, tab] of this.tabs)
+      if (!live.has(id)) {
+        this.connections.get(tab.id)?.close();
+        this.connections.delete(tab.id);
+        this.tabs.delete(id);
+      }
+    return results;
+  }
+  tab(id) {
+    const tab = [...this.tabs.values()].find((tab) => tab.id === id);
+    if (!tab)
+      throw new Error(`Unknown or stale browser tab: ${id}; list tabs again`);
+    return tab;
+  }
+  async attach(id) {
+    if (this.connections.has(id)) return this.connections.get(id);
+    if (!this.connecting.has(id))
+      this.connecting.set(
+        id,
+        this.openTab(id).finally(() => this.connecting.delete(id)),
+      );
+    return this.connecting.get(id);
+  }
+  async openTab(id) {
+    if (this.connections.has(id)) return this.connections.get(id);
+    const tab = this.tab(id);
+    const connection = await new CdpConnection().open(
+      `${this.url.replace("http", "ws")}/devtools/page/${tab.targetId}`,
+    );
+    this.connections.set(id, connection);
+    connection.on("event", (event) =>
+      this.emit("event", {
+        source: {
+          tabId: id,
+          ...(event.sessionId ? { sessionId: event.sessionId } : {}),
+        },
+        method: event.method,
+        params: event.params ?? {},
+      }),
+    );
+    connection.on("close", () => {
+      if (this.connections.get(id) === connection) this.connections.delete(id);
+      for (const [key, record] of this.interceptions)
+        if (record.connection === connection) this.interceptions.delete(key);
+    });
+    return connection;
+  }
+  // Agent 开的拦截按标签、子 session 和种类记下；暂停期间新开的拦截立即关掉，恢复时按原参数重开。
+  async recordInterception(target, method, params, connection) {
+    const off = INTERCEPTIONS.get(method);
+    const key = JSON.stringify([target.tabId, target.sessionId ?? "", off[0]]);
+    if (method === "Fetch.disable" || (method !== "Fetch.enable" && !params.enabled))
+      return void this.interceptions.delete(key);
+    this.interceptions.set(key, { connection, sessionId: target.sessionId, on: [method, params], off });
+    if (!this.intercepting) await connection.send(...off, target.sessionId);
+  }
+  // 关掉 Fetch 会放行全部已暂停的响应；关不掉就断开连接，Chromium 同样会放行并恢复原生行为。
+  async setInterception(on) {
+    if (this.intercepting === on) return;
+    this.intercepting = on;
+    await Promise.all([...this.interceptions.values()].map(async (record) => {
+      try {
+        await record.connection.send(...(on ? record.on : record.off), record.sessionId, 2000);
+      } catch (error) {
+        console.error("Computer request interception switch failed:", error.message);
+        record.connection.close();
+      }
+    }));
+  }
+  /** 记录已送出的输入，取消后用相同 CDP target 发送 release。 */
+  async execute(params, context) {
+    const { target, method, commandParams = {} } = params;
+    const connection = await this.attach(target.tabId);
+    const key = JSON.stringify([context?.session_id, target.tabId, target.sessionId ?? ""]);
+    let input = this.inputs.get(key);
+    if (!input) {
+      input = {
+        owner: context?.session_id,
+        target,
+        buttons: new Map(),
+        keys: new Map(),
+        touch: false,
+        emulatedTouch: null,
+      };
+      this.inputs.set(key, input);
+    }
+    if (method === "Input.dispatchMouseEvent") {
+      if (commandParams.type === "mousePressed")
+        input.buttons.set(commandParams.button, { ...commandParams });
+    }
+    if (method === "Input.dispatchKeyEvent") {
+      const code =
+        commandParams.code ??
+        commandParams.key ??
+        commandParams.windowsVirtualKeyCode;
+      if (["keyDown", "rawKeyDown"].includes(commandParams.type))
+        input.keys.set(code, { ...commandParams });
+    }
+    if (
+      method === "Input.dispatchTouchEvent" &&
+      ["touchStart", "touchMove"].includes(commandParams.type)
+    )
+      input.touch = true;
+    if (method === "Input.emulateTouchFromMouseEvent") {
+      if (commandParams.type === "mousePressed")
+        input.emulatedTouch = { ...commandParams };
+      if (commandParams.type === "mouseMoved" && input.emulatedTouch)
+        Object.assign(input.emulatedTouch, {
+          x: commandParams.x,
+          y: commandParams.y,
+        });
+    }
+    if (method === "Page.close") {
+      const tab = this.tab(target.tabId);
+      this.checkOwner(tab, context);
+    }
+    const result = await connection.send(
+      method,
+      commandParams,
+      target.sessionId,
+      params.timeoutMs ?? (method === "Page.navigate" ? NAVIGATE_CEILING_MS : undefined),
+    );
+    if (INTERCEPTIONS.has(method))
+      await this.recordInterception(target, method, commandParams, connection);
+    if (
+      method === "Input.dispatchMouseEvent" &&
+      commandParams.type === "mouseReleased"
+    )
+      input.buttons.delete(commandParams.button);
+    if (method === "Input.dispatchKeyEvent" && commandParams.type === "keyUp")
+      input.keys.delete(
+        commandParams.code ??
+          commandParams.key ??
+          commandParams.windowsVirtualKeyCode,
+      );
+    if (
+      method === "Input.dispatchTouchEvent" &&
+      ["touchEnd", "touchCancel"].includes(commandParams.type)
+    )
+      input.touch = false;
+    if (
+      method === "Input.emulateTouchFromMouseEvent" &&
+      commandParams.type === "mouseReleased"
+    )
+      input.emulatedTouch = null;
+    // 只投影个人桌面的已完成输入；匿名 Context 没有 cursor 消费者。
+    if (this.listenerCount("cursor")) {
+      const point = method === "Input.dispatchTouchEvent" ? commandParams.touchPoints?.[0] : commandParams;
+      const mouse = ["Input.dispatchMouseEvent", "Input.emulateTouchFromMouseEvent"].includes(method)
+        && ["mouseMoved", "mousePressed", "mouseWheel"].includes(commandParams.type);
+      const touch = method === "Input.dispatchTouchEvent"
+        && ["touchStart", "touchMove"].includes(commandParams.type);
+      if (mouse || touch) await this.publishCursor(connection, point,
+        ["mousePressed", "touchStart"].includes(commandParams.type) ? "click" : "move");
+    }
+    return result;
+  }
+  /** 将主页面 CSS 坐标换算到同一 X11 桌面；投影失败不重试已送出的输入。 */
+  async publishCursor(connection, point, kind) {
+    try {
+      // 1. 页面必须正在显示；浏览器缩放包含在 DPR 中，装饰边框不缩放。
+      const { result, exceptionDetails } = await connection.send("Runtime.evaluate", {
+        expression: `(() => {
+          if (document.visibilityState !== "visible") return null;
+          const scale = devicePixelRatio;
+          const border = Math.max(0, (outerWidth - innerWidth * scale) / 2);
+          return {x: screenX + border + ${JSON.stringify(point.x)} * scale,
+            y: screenY + outerHeight - innerHeight * scale - border + ${JSON.stringify(point.y)} * scale,
+            width: screen.width, height: screen.height};
+        })()`, returnByValue: true,
+      }, undefined, 250);
+      if (exceptionDetails) throw new Error(exceptionDetails.text);
+      // 2. 隐藏标签或桌面外的点击不把坐标画到当前桌面上。
+      const value = result.value;
+      const visible = value && value.x >= 0 && value.y >= 0
+        && value.x < value.width && value.y < value.height;
+      this.emit("cursor", { point: visible ? { ...value, kind } : null });
+    } catch (error) {
+      console.error("Computer browser cursor read failed:", error.message);
+      this.emit("cursor", { point: null, error: "操作位置读取失败" });
+    }
+  }
+  checkOwner(tab, context) {
+    const owner = tab.created ?? tab.claimed;
+    if (!context || owner?.session_id !== context.session_id)
+      throw new Error(
+        "Claim this tab in the current Session before closing or marking it",
+      );
+  }
+  async call(method, params = {}, context) {
+    switch (method) {
+      case "ping":
+        return "pong";
+      case "getInfo":
+        return {
+          type: "cdp",
+          name: this.name,
+          family: "chrome",
+          capabilities: { browser: [], tab: [] },
+          apiSupportOverrides: {
+            "Browser.user": true,
+            "Tab.markDeliverable": true,
+            "Tab.markHandoff": true,
+          },
+        };
+      case "getTabs":
+      case "getUserTabs":
+        return this.listTabs();
+      case "attach":
+        await this.attach(params.tabId);
+        return;
+      case "detach":
+        this.connections.get(params.tabId)?.close();
+        this.connections.delete(params.tabId);
+        return;
+      case "attachTarget": {
+        const connection = await this.attach(params.tabId);
+        return connection.send("Target.attachToTarget", {
+          targetId: params.targetId,
+          flatten: true,
+        });
+      }
+      case "detachTarget":
+        return (await this.attach(params.tabId)).send(
+          "Target.detachFromTarget",
+          { targetId: params.targetId },
+        );
+      case "executeCdp":
+        return this.execute(params, context);
+      case "executeCdpWithCachedExpression": {
+        const { expressionCacheKey: key, commandParams } = params;
+        if (commandParams.expression != null)
+          this.expressions.set(key, commandParams.expression);
+        if (!this.expressions.has(key)) return { kind: "cache_miss" };
+        return {
+          kind: "executed",
+          result: await this.execute(
+            {
+              ...params,
+              commandParams: {
+                ...commandParams,
+                expression: this.expressions.get(key),
+              },
+            },
+            context,
+          ),
+        };
+      }
+      case "createTab": {
+        // 每个 Agent 标签是独立窗口：互不遮挡渲染，也不切走用户正在看的标签。
+        this.creatingInternalTargets++;
+        let targetId;
+        try {
+          ({ targetId } = await this.browser.send("Target.createTarget", {
+            url: "about:blank",
+            newWindow: true,
+            background: true,
+            ...(this.browserContextId
+              ? { browserContextId: this.browserContextId }
+              : {}),
+          }));
+        } finally {
+          this.creatingInternalTargets--;
+        }
+        await this.screen.place(this.browser, targetId);
+        await this.listTabs();
+        const tab = this.tabs.get(targetId);
+        tab.created = {
+          session_id: context.session_id,
+          turn_id: context.turn_id,
+        };
+        return { id: tab.id, title: tab.title, url: tab.url };
+      }
+      case "claimUserTab": {
+        await this.listTabs();
+        const tab = this.tab(params.tabId);
+        const owner = tab.created ?? tab.claimed;
+        if (owner && owner.session_id !== context.session_id)
+          throw new Error("Tab belongs to another live Session");
+        tab.claimed = {
+          session_id: context.session_id,
+          turn_id: context.turn_id,
+        };
+        return { id: tab.id, title: tab.title, url: tab.url };
+      }
+      case "markTab":
+        this.checkOwner(this.tab(params.tabId), context);
+        this.tab(params.tabId).status = params.status;
+        return;
+      case "nameSession":
+        this.sessionNames.set(context.session_id, params.name);
+        return;
+      case "moveMouse": {
+        // 浏览器 UI 的指针移动不能松开 CDP 已按住的键，否则网页会中断拖拽。
+        const held = this.inputs.get(JSON.stringify([context?.session_id, params.tabId, ""]))?.buttons;
+        const masks = { left: 1, right: 2, middle: 4, back: 8, forward: 16 };
+        let buttons = 0;
+        for (const button of held?.keys() ?? []) buttons |= masks[button];
+        return this.execute({
+          target: { tabId: params.tabId },
+          method: "Input.dispatchMouseEvent",
+          commandParams: {
+            type: "mouseMoved", x: params.x, y: params.y,
+            button: held?.keys().next().value ?? "none", buttons,
+          },
+        });
+      }
+      case "turnEnded":
+        return this.endTurn(context);
+      default:
+        throw new Error(
+          `Browser backend method is unavailable in this container: ${method}`,
+        );
+    }
+  }
+  async endTurn({ session_id, turn_id }) {
+    for (const tab of this.tabs.values()) {
+      const owned = tab.created ?? tab.claimed;
+      if (owned?.session_id !== session_id || owned?.turn_id !== turn_id)
+        continue;
+      if (tab.created && !["deliverable", "handoff"].includes(tab.status)) {
+        await this.browser.send("Target.closeTarget", {
+          targetId: tab.targetId,
+        });
+      }
+      tab.created = null;
+      tab.claimed = null;
+      tab.status = null;
+    }
+  }
+  /** 只松开这个 Session 按住的键鼠；不给 Session 时松开全部（人工接管与关闭）。 */
+  async releaseInputs(sessionId) {
+    const errors = [];
+    for (const input of this.inputs.values()) {
+      if (sessionId !== undefined && input.owner !== sessionId) continue;
+      const connection = this.connections.get(input.target.tabId);
+      if (!connection) {
+        if (
+          input.buttons.size ||
+          input.keys.size ||
+          input.touch ||
+          input.emulatedTouch
+        )
+          errors.push(
+            new Error("Lost CDP input owner; release cannot be confirmed"),
+          );
+        continue;
+      }
+      if (input.touch) {
+        try {
+          await connection.send(
+            "Input.dispatchTouchEvent",
+            { type: "touchCancel", touchPoints: [] },
+            input.target.sessionId,
+          );
+          input.touch = false;
+        } catch (error) {
+          errors.push(error);
+        }
+      }
+      if (input.emulatedTouch) {
+        try {
+          await connection.send(
+            "Input.emulateTouchFromMouseEvent",
+            { ...input.emulatedTouch, type: "mouseReleased" },
+            input.target.sessionId,
+          );
+          input.emulatedTouch = null;
+        } catch (error) {
+          errors.push(error);
+        }
+      }
+      for (const [button, params] of input.buttons) {
+        try {
+          await connection.send(
+            "Input.dispatchMouseEvent",
+            { ...params, type: "mouseReleased", buttons: 0 },
+            input.target.sessionId,
+          );
+          input.buttons.delete(button);
+        } catch (error) {
+          errors.push(error);
+        }
+      }
+      for (const [key, params] of input.keys) {
+        try {
+          await connection.send(
+            "Input.dispatchKeyEvent",
+            { ...params, type: "keyUp" },
+            input.target.sessionId,
+          );
+          input.keys.delete(key);
+        } catch (error) {
+          errors.push(error);
+        }
+      }
+    }
+    for (const [key, input] of this.inputs)
+      if (
+        !input.buttons.size &&
+        !input.keys.size &&
+        !input.touch &&
+        !input.emulatedTouch
+      )
+        this.inputs.delete(key);
+    if (errors.length)
+      throw new AggregateError(errors, "Browser input release failed");
+  }
+  close() {
+    for (const connection of this.connections.values()) connection.close();
+    this.connections.clear();
+    this.browser?.close();
+  }
+}

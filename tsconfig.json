@@ -1,0 +1,27 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "types": ["node"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "resolveJsonModule": true,
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noImplicitReturns": true,
+    "baseUrl": ".",
+    "paths": {
+      "@cable/web-ui-v1": ["packages/cable-web-ui-v1/index.d.ts"],
+      "@cable/chat-ui-v1": ["packages/cable-chat-ui-v1/index.d.ts"],
+      "@cable/shell-ui-v1": ["packages/cable-shell-ui-v1/index.d.ts"],
+      "@cable/conversation-tools-v2": ["packages/cable-conversation-tools-v2/index.d.ts"],
+      "@/*": ["frontend/plugins/cable_clients/chat/src/*"]
+    },
+    "noEmit": true,
+    "jsx": "react-jsx"
+  },
+  "exclude": ["frontend/plugins/design/editor/**", "frontend/plugins/ui/dashboard/*.ts", "frontend/plugins/cable_clients/chat/*.ts"],
+  "include": ["frontend/plugins/**/*.ts", "frontend/plugins/**/*.tsx", "frontend/plugins/ui/dashboard/src/**/*.ts", "frontend/plugins/ui/dashboard/src/**/*.tsx", "frontend/plugins/cable_clients/chat/src/**/*.ts", "frontend/plugins/cable_clients/chat/src/**/*.tsx", "frontend/plugins/cable_clients/chat/harness/**/*.tsx", "packages/cable-theme/src/**/*.ts", "packages/cable-plugin-kit/src/**/*.ts", "packages/cable-plugin-kit/src/**/*.tsx", "plugins/**/*.ts", "plugins/**/*.tsx", "packages/**/*.d.ts", "types/**/*.d.ts"]
+}

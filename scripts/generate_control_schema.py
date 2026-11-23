@@ -1,0 +1,49 @@
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+from pydantic import TypeAdapter
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
+from plugins.gateway.protocol.models import METHOD_PARAMS
+from plugins.programmatic.control import PARAMS as PROGRAMMATIC_PARAMS
+
+
+OUTPUT = ROOT / "schema" / "app-server-v2.json"
+
+
+def build_schema() -> dict[str, object]:
+    """从服务端 typed params 生成确定性的协议 schema。"""
+    methods = {
+        method: TypeAdapter(model).json_schema()
+        for method, model in sorted({**METHOD_PARAMS, **PROGRAMMATIC_PARAMS}.items())
+    }
+    return {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": "Cable App Server Protocol v2",
+        "protocolVersion": "2.0",
+        "transport": "JSON-RPC 2.0 NDJSON",
+        "methods": methods,
+        "notifications": ["session/event", "session/error"],
+    }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    _ = parser.add_argument("--check", action="store_true")
+    args = parser.parse_args()
+    encoded = json.dumps(build_schema(), ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    if args.check:
+        return 0 if OUTPUT.is_file() and OUTPUT.read_text(encoding="utf-8") == encoded else 1
+    OUTPUT.parent.mkdir(parents=True, exist_ok=True)
+    OUTPUT.write_text(encoded, encoding="utf-8")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

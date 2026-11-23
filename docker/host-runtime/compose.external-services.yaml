@@ -1,0 +1,9 @@
+services:
+  cable-core:
+    networks:
+      - cable-services
+
+networks:
+  cable-services:
+    external: true
+    name: "${CABLE_SERVICES_NETWORK:-cable-services}"

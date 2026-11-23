@@ -1,0 +1,176 @@
+services:
+  cable-core:
+    init: true
+    image: "${CABLE_IMAGE:?CABLE_IMAGE is required}"
+    container_name: "${CABLE_CONTAINER_NAME:?CABLE_CONTAINER_NAME is required}"
+    user: "${CABLE_UID:-1000}:${CABLE_GID:-1000}"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+      - seccomp:${CABLE_RUNTIME_CHECKOUT:?CABLE_RUNTIME_CHECKOUT is required}/docker/host-runtime/chromium-seccomp.json
+    environment:
+      CABLE_CONFIG: "${CABLE_CONFIG:?CABLE_CONFIG is required}"
+      CABLE_WORKSPACE: "${CABLE_WORKSPACE:?CABLE_WORKSPACE is required}"
+      CABLE_HOST_BRIDGE_SOCKET: "${CABLE_HOST_BRIDGE_SOCKET:?CABLE_HOST_BRIDGE_SOCKET is required}"
+      CABLE_HOST_BRIDGE_TOKEN: "${CABLE_HOST_BRIDGE_TOKEN:?CABLE_HOST_BRIDGE_TOKEN is required}"
+      CABLE_HOST_TOOLCHAIN_DIGEST: "${CABLE_HOST_TOOLCHAIN_DIGEST:?CABLE_HOST_TOOLCHAIN_DIGEST is required}"
+      CABLE_EXECUTION_MODE: host-bridge
+      CABLE_RUNTIME_COMMIT: "${CABLE_RUNTIME_COMMIT:?CABLE_RUNTIME_COMMIT is required}"
+      CABLE_RUNTIME_TREE: "${CABLE_RUNTIME_TREE:?CABLE_RUNTIME_TREE is required}"
+      CABLE_RUNTIME_CHECKOUT: "${CABLE_RUNTIME_CHECKOUT:?CABLE_RUNTIME_CHECKOUT is required}"
+      CABLE_LOG_FORMAT: "json"
+      CABLE_LOG_LEVEL: "${CABLE_LOG_LEVEL:-INFO}"
+      CABLE_SERVICE_NAME: "cable-core"
+      CABLE_RELEASE_MANIFEST: /run/cable-release.json
+      CABLE_PLUGIN_HOME: "${CABLE_EXPERIMENT_ROOT:?CABLE_EXPERIMENT_ROOT is required}/plugin-home"
+      CABLE_WORKLOAD_SOCKET: "${CABLE_WORKLOAD_RUNTIME_DIR:-${CABLE_EXPERIMENT_ROOT}/workload-runtime}/controller.sock"
+      CABLE_READINESS_TIMEOUT_S: "${CABLE_READINESS_TIMEOUT_S:-120}"
+      CABLE_WEB_HOST: "0.0.0.0"
+      CABLE_WEB_ALLOW_NON_LOOPBACK: "1"
+      CABLE_WEB_PORT: "2236"
+      OPENCODE_GO_API_KEY: "${OPENCODE_GO_API_KEY:?OPENCODE_GO_API_KEY is required}"
+      HOME: /home/huashen
+      TZ: "${TZ:-Asia/Shanghai}"
+      PYTHONUNBUFFERED: "1"
+      # glibc 默认每个线程各有 arena，释放后不归还系统；后台线程轮流做大块临时分配会把 RSS
+      # 撑到约 线程数 × 峰值（#1455）。限为 2 个 arena，Python 线程本就受 GIL 串行，争用可忽略。
+      MALLOC_ARENA_MAX: "2"
+    volumes:
+      - type: bind
+        source: "${CABLE_EXPERIMENT_ROOT:?CABLE_EXPERIMENT_ROOT is required}"
+        target: "${CABLE_EXPERIMENT_ROOT:?CABLE_EXPERIMENT_ROOT is required}"
+      - type: bind
+        source: "${CABLE_HOST_BRIDGE_DIR:?CABLE_HOST_BRIDGE_DIR is required}"
+        target: "${CABLE_HOST_BRIDGE_DIR:?CABLE_HOST_BRIDGE_DIR is required}"
+      - type: bind
+        source: "${CABLE_WORKLOAD_RUNTIME_DIR:-${CABLE_EXPERIMENT_ROOT}/workload-runtime}"
+        target: "${CABLE_WORKLOAD_RUNTIME_DIR:-${CABLE_EXPERIMENT_ROOT}/workload-runtime}"
+      - type: bind
+        source: "${CABLE_RUNTIME_CHECKOUT:?CABLE_RUNTIME_CHECKOUT is required}"
+        target: "${CABLE_RUNTIME_CHECKOUT:?CABLE_RUNTIME_CHECKOUT is required}"
+        read_only: true
+      - type: bind
+        source: "${CABLE_HOST_PYTHON_PREFIX:?CABLE_HOST_PYTHON_PREFIX is required}"
+        target: "${CABLE_HOST_PYTHON_PREFIX:?CABLE_HOST_PYTHON_PREFIX is required}"
+        read_only: true
+      - type: bind
+        source: "${CABLE_RELEASE_MANIFEST:?CABLE_RELEASE_MANIFEST is required}"
+        target: /run/cable-release.json
+        read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=256m,mode=1777
+      - /run:rw,nosuid,nodev,noexec,size=32m,mode=755
+      - /home/huashen:rw,nosuid,nodev,exec,size=128m,mode=700,uid=1000,gid=1000
+    ports:
+      - "${CABLE_WEB_BIND_ADDRESS:-127.0.0.1}:${CABLE_PUBLISHED_WEB_PORT:-2236}:2236"
+    healthcheck:
+      test: ["CMD", "/opt/venv/bin/python", "/opt/cable/source/docker/host-runtime/healthcheck.py"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: "${CABLE_READINESS_TIMEOUT_S:-120}s"
+      # 启动期每秒探测：就绪后最多晚 1s 被发布器看到，而不是一个完整 interval。
+      start_interval: 1s
+    stop_grace_period: 60s
+    logging:
+      driver: local
+      options:
+        max-size: "50m"
+        max-file: "5"
+    restart: "no"
+    # Core 开机到首次使用 Controller 要数秒；并行启动，host_execution 首次使用前自己等 socket。
+    depends_on:
+      workload-controller:
+        condition: service_started
+    networks:
+      - default
+      - cable-workloads
+
+  workload-controller:
+    image: "${CABLE_IMAGE:?CABLE_IMAGE is required}"
+    container_name: "${CABLE_CONTAINER_NAME:?CABLE_CONTAINER_NAME is required}-workloads"
+    user: "${CABLE_UID:-1000}:${CABLE_GID:-1000}"
+    group_add:
+      - "${CABLE_DOCKER_GID:?CABLE_DOCKER_GID is required}"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      HOME: /tmp
+      PYTHONPATH: /opt/cable/source
+      PYTHONUNBUFFERED: "1"
+    entrypoint:
+      - /opt/venv/bin/python
+      - -m
+      - agent.plugins.entrypoints
+      - --distribution
+      - /opt/cable/distribution
+      - --workspace
+      - "${CABLE_WORKSPACE:?CABLE_WORKSPACE is required}"
+      - --config
+      - "${CABLE_CONFIG:?CABLE_CONFIG is required}"
+      - workload-controller
+    command:
+      - --workspace
+      - "${CABLE_WORKSPACE:?CABLE_WORKSPACE is required}"
+      - --socket
+      - "${CABLE_WORKLOAD_RUNTIME_DIR:-${CABLE_EXPERIMENT_ROOT}/workload-runtime}/controller.sock"
+      - --state
+      - "${CABLE_EXPERIMENT_ROOT:?CABLE_EXPERIMENT_ROOT is required}/workload-controller/leases.json"
+      - --network
+      - "${CABLE_WORKLOAD_NETWORK:-cable-workloads}"
+      - --allowed-uid
+      - "${CABLE_UID:-1000}"
+      - --socket-gid
+      - "${CABLE_GID:-1000}"
+      - --socket-uid
+      - "${CABLE_UID:-1000}"
+      - --workload-uid
+      - "${CABLE_UID:-1000}"
+      - --workload-gid
+      - "${CABLE_GID:-1000}"
+      - --owner-container
+      - "${CABLE_CONTAINER_NAME:?CABLE_CONTAINER_NAME is required}"
+      - --host-egress-dir
+      - "${CABLE_WORKLOAD_RUNTIME_DIR:-${CABLE_EXPERIMENT_ROOT}/workload-runtime}/host-egress"
+    volumes:
+      - type: bind
+        source: /var/run/docker.sock
+        target: /var/run/docker.sock
+      - type: bind
+        source: "${CABLE_WORKSPACE:?CABLE_WORKSPACE is required}/plugin-data"
+        target: "${CABLE_WORKSPACE:?CABLE_WORKSPACE is required}/plugin-data"
+      - type: bind
+        source: "${CABLE_WORKSPACE:?CABLE_WORKSPACE is required}/runtime/plugin-validation"
+        target: "${CABLE_WORKSPACE:?CABLE_WORKSPACE is required}/runtime/plugin-validation"
+      - type: bind
+        source: "${CABLE_WORKLOAD_RUNTIME_DIR:-${CABLE_EXPERIMENT_ROOT}/workload-runtime}"
+        target: "${CABLE_WORKLOAD_RUNTIME_DIR:-${CABLE_EXPERIMENT_ROOT}/workload-runtime}"
+      - type: bind
+        source: "${CABLE_EXPERIMENT_ROOT:?CABLE_EXPERIMENT_ROOT is required}/workload-controller"
+        target: "${CABLE_EXPERIMENT_ROOT:?CABLE_EXPERIMENT_ROOT is required}/workload-controller"
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=32m,mode=1777
+      - /run:rw,nosuid,nodev,noexec,size=8m,mode=755
+    healthcheck:
+      test:
+        - CMD
+        - /usr/bin/test
+        - -S
+        - "${CABLE_WORKLOAD_RUNTIME_DIR:-${CABLE_EXPERIMENT_ROOT}/workload-runtime}/controller.sock"
+      interval: 5s
+      timeout: 2s
+      retries: 12
+      # Core 依赖它 healthy 才启动；socket 出现后 1s 内放行。
+      start_period: 60s
+      start_interval: 1s
+    stop_grace_period: 45s
+    restart: "no"
+
+networks:
+  cable-workloads:
+    name: "${CABLE_WORKLOAD_NETWORK:-cable-workloads}"

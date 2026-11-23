@@ -1,0 +1,88 @@
+# Cable 插件边界清单：当前在 Core 源码中声明的字面 ServiceKey。
+#
+# 本文件的每个条目必须对应代码中真实存在的 ServiceKey，反之亦然；
+# 由 `python scripts/plugin_boundary.py check` 强制（R4）。
+# 新增声明必须登记 role，否则静态门失败；登记不授予运行时权限。
+#
+# 九个中立 key 由 Core 独占；R7、R10 同时核对声明和 provider。
+# Runtime 不读取本表。表不证明原子性、消费者权限或独立替换成功。
+# 业务合同由提供方插件公开，不在 Core 中登记第二份归属。
+
+[capabilities]
+
+[capabilities."core.credentials"]
+role = "core"
+note = "Core 按可信插件 owner 打开短凭据租约"
+
+[capabilities."host.execution.v1"]
+role = "core"
+note = "Core 只拥有执行身份与 generation 作用域；实际进程和文件由插件提供"
+
+[capabilities."core.host_info"]
+role = "core"
+note = "宿主装配固定提供 boot identity 与 validation marker 的只读值"
+
+[capabilities."core.runtime_catalog.v1"]
+role = "core"
+note = "按当前 live Root 提供中立插件、Fiber 与健康只读投影"
+
+[capabilities."core.tasks"]
+role = "core"
+note = "按通用 key 串行准入的短命工作与资源"
+
+[capabilities."core.restart_gate.v1"]
+role = "core"
+note = "重启提交权与外部效果 permit"
+
+[capabilities."core.plugin_updates"]
+role = "core"
+note = "插件 install/uninstall/revert 状态"
+
+# 尚未实现的文档名称不能重新作为隐式合同出现。
+[phantom.SCOPED_TURNS]
+note = "多份设计文档称其为已具备的 Turn 原子；实际由 plugins/reply 的 run_reply 顶替"
+
+[phantom.CONTINUATIONS]
+note = "content-wake 设计列为现有原子；代码中无此 ServiceKey"
+
+[phantom.BACKGROUND_JOBS]
+note = "插件手册与 skill 文档仍在教学使用；代码中无此 ServiceKey"
+
+[capabilities."core.plugin_config.v1"]
+role = "core"
+note = "按实际 Context 应用自身固定输入；沿 selection CAS 与局部换代，不解释业务字段"
+
+# R12：UI 宿主只提供通用扩展点。宿主插件可以导入的只有基础设施合同；
+# 其余插件的功能由它自己的前端模块经 UI_SLOTS 贡献，宿主不点名。
+[ui_hosts]
+plugins = ["cable_clients", "ui"]
+infrastructure = ["ui", "ledger", "channels", "gateway", "content", "tools", "workloads", "reply"]
+frontend = ["frontend/plugins/cable_clients/chat/src"]
+host_routes = ["/api/chat/sessions", "/api/chat/artifacts", "/api/chat/uploads", "/api/chat/plugin-ui",
+               "/api/chat/navigation", "/api/shell/state"]
+
+# R14：插件分层。core 层不得 import extra 层的任何模块（含 contract）；
+# extra 层可按计划迁到外部仓库。新增插件必须在此二选一。
+[tiers]
+core = [
+    "ledger", "ledger_invariants", "content", "content_view", "context", "turn_projection",
+    "sources", "conversation", "reply", "reply_program", "react", "prompt", "compaction",
+    "programmatic", "tools", "tool_search", "host_execution", "workloads", "managed_processes",
+    "working_directory", "shell", "files", "jobs", "models", "openai_compatible", "ui",
+    "cable_clients", "shell_ui", "conversation_ui", "web_auth", "onboarding", "plugin_settings",
+    "assets", "gateway", "channels", "delivery", "delivery_policy", "cable_sender",
+    "plugin_update", "skills", "commands", "mcp", "codemode", "runtime_inspection",
+    "runtime_diagnostics",
+]
+extra = []
+
+# 已迁出 Core 的插件：目录不再存在，但仍按 extra 层约束（core 层不得 import 它们）。
+# 迁出一个插件时，把名字从上面的 extra 移到这里；extra 仓库自己的新插件由它的 extra_tiers.toml 声明，不进本表。
+external = [
+    "akasha", "codex", "computer", "design", "gemini", "goal", "main_session", "markdown_memory",
+    "markdown_reader", "message_push", "opencode_go", "privacy_mask", "projects", "scheduler",
+    "session_title", "stable_view", "standard_web", "subagent",
+    "subagent_claude_code", "subagent_codex", "telegram_channel", "telegram_sender", "terminal",
+    "timer", "userinformation", "vision", "visuals", "watch", "web_fetch_http",
+    "web_search_exa", "web_search_searxng", "workspace_changes",
+]

@@ -1,0 +1,5 @@
+[runtime]
+# 未传 --workspace 且未设置 CABLE_WORKSPACE 时使用；~ 会在启动时展开。
+workspace = "~/.cable/workspace"
+
+# 插件配置位于 <workspace>/plugin-data/<插件名>-<市场>/config.input.json，由插件配置程序写入。

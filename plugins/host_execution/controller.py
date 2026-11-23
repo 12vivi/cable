@@ -1,0 +1,1702 @@
+from __future__ import annotations
+
+import argparse
+import asyncio
+import fcntl
+import hashlib
+import http.client
+import json
+import logging
+import os
+import re
+import signal
+import socket
+import stat
+import struct
+import sys
+import tempfile
+import threading
+import time
+from uuid import uuid4
+from dataclasses import asdict
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import AsyncExitStack, asynccontextmanager
+from functools import cache
+from pathlib import Path, PurePosixPath
+from collections.abc import Coroutine, Mapping
+from typing import Any, TypeVar, cast
+from urllib.parse import quote, urlencode, urlsplit
+
+from core.common.file_io import shield_until_done
+from plugins.host_execution.contract import (
+    WorkloadLease,
+    WorkloadMode,
+    WorkloadStartRequest,
+)
+
+_SEGMENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@-]{0,127}$")
+_NAME = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
+_IMAGE = re.compile(r"^[^\s@]+@sha256:[0-9a-f]{64}$")
+_IMAGE_PULL_TIMEOUT_S = 600.0
+_IMAGE_INSPECT_TIMEOUT_S = 30.0
+_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@-]{0,511}$")
+_API_VERSION = "v1.47"
+_OWNER_LABEL = "com.cable.workload"
+_HOST_GATEWAY = "host.docker.internal:host-gateway"
+# 声明了 host_egress 的 Workload 在这里看到 Host Bridge 的 SOCKS5 socket（socks.sock）。
+HOST_EGRESS_TARGET = "/run/cable/host-egress"
+_USERNS_SECCOMP_PATH = Path(__file__).with_name("userns-seccomp.json")
+_T = TypeVar("_T")
+logger = logging.getLogger(__name__)
+
+
+# 启动失败且已核实没有留下容器或 lease；回包带 residual=none，Core 据此不再挂起这次请求。
+class _NoResidualStart(Exception):
+    pass
+
+
+class _UnixHttpConnection(http.client.HTTPConnection):
+    def __init__(self, socket_path: Path) -> None:
+        super().__init__("docker", timeout=60)
+        self._socket_path = socket_path
+
+    def connect(self) -> None:
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(self.timeout)
+        self.sock.connect(str(self._socket_path))
+
+
+class DockerEngine:
+    """Call only the small Docker API surface needed by Workloads."""
+
+    def __init__(self, socket_path: Path) -> None:
+        self._socket_path = socket_path
+
+    @property
+    def socket_path(self) -> Path:
+        return self._socket_path
+
+    async def request(
+        self,
+        method: str,
+        path: str,
+        *,
+        body: dict[str, object] | None = None,
+        expected: frozenset[int],
+    ) -> object:
+        return await asyncio.to_thread(
+            self._request_sync,
+            method,
+            path,
+            body,
+            expected,
+        )
+
+    def _request_sync(
+        self,
+        method: str,
+        path: str,
+        body: dict[str, object] | None,
+        expected: frozenset[int],
+    ) -> object:
+        encoded = None if body is None else json.dumps(body).encode("utf-8")
+        connection = _UnixHttpConnection(self._socket_path)
+        try:
+            connection.request(
+                method,
+                f"/{_API_VERSION}{path}",
+                body=encoded,
+                headers=(
+                    {} if encoded is None else {"Content-Type": "application/json"}
+                ),
+            )
+            response = connection.getresponse()
+            raw = response.read()
+            if response.status not in expected:
+                detail = raw.decode("utf-8", errors="replace")[:4096]
+                raise RuntimeError(
+                    f"Docker API {method} {path} -> {response.status}: {detail}"
+                )
+            if response.status == 404:
+                return None
+            if not raw:
+                return None
+            value = json.loads(raw)
+            if not isinstance(value, (dict, list)):
+                raise RuntimeError("Docker API 返回了无效 JSON")
+            return value
+        finally:
+            connection.close()
+
+
+class _OperationAborted(RuntimeError):
+    pass
+
+
+class _AbortableConnection(http.client.HTTPConnection):
+    """到 Docker 引擎的连接：socket 一创建就登记到所属操作，connect 之前和之后都能被中止。"""
+
+    def __init__(self, socket_path: Path, operation: "_ImageOperation", timeout: float) -> None:
+        super().__init__("docker", timeout=timeout)
+        self._socket_path = socket_path
+        self._operation = operation
+
+    def connect(self) -> None:
+        stream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self._operation.register(stream)
+        stream.settimeout(self.timeout)
+        stream.connect(str(self._socket_path))
+        self.sock = stream
+
+
+class _ImageOperation:
+    """一次 image_ensure：自己的中止标志、自己的 socket、自己的期限。计时器与控制器停止都只作用于这个对象，
+    所以上一次请求迟到的计时器回调不会碰到下一次请求。只保证期限到了请求返回失败，不承诺线程会被杀。"""
+
+    def __init__(self, socket_path: Path, total_seconds: float, inspect_seconds: float) -> None:
+        self._socket_path = socket_path
+        self._inspect_seconds = inspect_seconds
+        self._lock = threading.Lock()
+        self._aborted = False
+        self._socket: socket.socket | None = None
+        self._deadline = time.monotonic() + total_seconds
+        self._total = total_seconds
+        self._timer = threading.Timer(total_seconds, self.abort)
+        self._timer.daemon = True
+        self._running = False
+
+    def abort(self) -> None:
+        with self._lock:
+            self._aborted = True
+            stream = self._socket
+        if stream is not None:
+            try:
+                stream.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+    def register(self, stream: socket.socket) -> None:
+        with self._lock:
+            if self._aborted:
+                stream.close()
+                raise _OperationAborted(self._message())
+            self._socket = stream
+
+    def _message(self) -> str:
+        return f"镜像操作超过 {self._total:.0f} 秒的总期限（或控制器正在停止），已中止"
+
+    def _check(self) -> None:
+        with self._lock:
+            aborted = self._aborted
+        if aborted or time.monotonic() >= self._deadline:
+            raise _OperationAborted(self._message())
+
+    def _timeout(self, limit: float) -> float:
+        return max(0.1, min(limit, self._deadline - time.monotonic()))
+
+    # 执行线程是否还活着：超时后线程可能没回来，控制器据此拒绝新的请求，任何时候最多一个幸存线程。
+    def alive(self) -> bool:
+        return self._running
+
+    def run(self, image: str) -> dict[str, object]:
+        self._running = True
+        self._timer.start()
+        try:
+            reference = quote(image, safe="")
+            status = self._request("GET", f"/images/{reference}/json", self._inspect_seconds, drain=True)
+            if status == 200:
+                return {"present": True, "pulled": False}
+            if status != 404:
+                raise RuntimeError(f"Docker 查询镜像失败（HTTP {status}）")
+            self._pull(reference)
+            return {"present": True, "pulled": True}
+        except OSError as error:
+            raise RuntimeError(self._message() if self._aborted else f"Docker 连接失败: {error}") from error
+        finally:
+            self._timer.cancel()
+            self._running = False
+
+    def _request(self, method: str, path: str, limit: float, *, drain: bool) -> int:
+        self._check()
+        connection = _AbortableConnection(self._socket_path, self, self._timeout(limit))
+        try:
+            connection.request(method, f"/{_API_VERSION}{path}")
+            self._check()
+            response = connection.getresponse()
+            if drain:
+                _ = response.read(1_048_576)
+            self._check()
+            return response.status
+        finally:
+            self._socket = None
+            connection.close()
+
+    # POST /images/create 的响应是逐行 JSON 进度：单行有大小上限，读到 error 就失败；读被中止打断不算完成。
+    def _pull(self, reference: str) -> None:
+        self._check()
+        connection = _AbortableConnection(self._socket_path, self, self._timeout(120.0))
+        try:
+            connection.request("POST", f"/{_API_VERSION}/images/create?fromImage={reference}")
+            self._check()
+            response = connection.getresponse()
+            if response.status != 200:
+                raise RuntimeError(f"Docker 拉取镜像失败（HTTP {response.status}）: {response.read(4096).decode('utf-8', errors='replace')}")
+            while True:
+                line = response.readline(1_048_576)
+                self._check()
+                if not line:
+                    return
+                try:
+                    record = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(record, dict) and record.get("error"):
+                    raise RuntimeError(f"拉取镜像失败: {str(record['error'])[:500]}")
+        finally:
+            self._socket = None
+            connection.close()
+
+
+class WorkloadControllerServer:
+    """Validate requests and own all Docker effects for plugin Workloads."""
+
+    def __init__(
+        self,
+        *,
+        workspace: Path,
+        socket_path: Path,
+        docker_socket: Path,
+        state_path: Path,
+        network: str,
+        allowed_uid: int,
+        socket_gid: int,
+        workload_uid: int,
+        workload_gid: int,
+        socket_uid: int = 0,
+        owner_container: str | None = None,
+        owner_grace_seconds: float = 10.0,
+        owner_poll_seconds: float = 2.0,
+        host_egress_dir: Path | None = None,
+    ) -> None:
+        self._workspace = workspace.resolve(strict=True)
+        self._host_egress_dir = host_egress_dir
+        self._socket_path = socket_path
+        self._engine = DockerEngine(docker_socket)
+        self._state_path = state_path
+        self._network = _safe_segment(network, "network")
+        self._allowed_uid = allowed_uid
+        self._socket_gid = socket_gid
+        self._socket_uid = socket_uid
+        self._owner_container = (
+            None
+            if owner_container is None
+            else _safe_segment(owner_container, "owner container")
+        )
+        if owner_grace_seconds <= 0 or owner_poll_seconds <= 0:
+            raise ValueError("Workload owner grace/poll 必须大于零")
+        self._owner_grace_seconds = owner_grace_seconds
+        self._owner_poll_seconds = owner_poll_seconds
+        self._owner_seen_running = False
+        self._owner_missing_since: float | None = None
+        if workload_uid <= 0 or workload_gid <= 0:
+            raise ValueError("Workload uid/gid 必须是非 root 正整数")
+        self._workload_uid = workload_uid
+        self._workload_gid = workload_gid
+        for relative in (Path("plugin-data"), Path("runtime/plugin-validation")):
+            root = (self._workspace / relative).resolve(strict=True)
+            if not root.is_relative_to(self._workspace):
+                raise ValueError(f"Workload data root 越界: {root}")
+            stat = root.stat()
+            if (stat.st_uid, stat.st_gid) != (workload_uid, workload_gid):
+                raise ValueError(f"Workload data root owner 不匹配: {root}")
+        self._workspace_id = hashlib.sha256(
+            str(self._workspace).encode("utf-8")
+        ).hexdigest()[:16]
+        self._lock = asyncio.Lock()
+        self._plugin_locks: dict[str, asyncio.Lock] = {}
+        self._workloads_ready = asyncio.Event()
+        self._workloads_ready.set()
+        self._closing = False
+        self._requests: set[asyncio.Task[None]] = set()
+        self._leases = self._load_leases()
+        self._image_active: str | None = None
+        self._image_operation: _ImageOperation | None = None
+        self._image_survivor: _ImageOperation | None = None
+        self._stopped_path = self._state_path.with_suffix(".stopped.json")
+        self._stopped = self._load_state(self._stopped_path)
+        self._controller_id = uuid4().hex
+
+    @asynccontextmanager
+    async def _plugin_access(self, plugin_id: str):
+        """Order effects that can share one plugin's writable mounts."""
+        while True:
+            await self._workloads_ready.wait()
+            lock = self._plugin_locks.setdefault(plugin_id, asyncio.Lock())
+            await lock.acquire()
+            if self._workloads_ready.is_set():
+                break
+            lock.release()
+        try:
+            yield
+        finally:
+            lock.release()
+
+    @asynccontextmanager
+    async def _maintenance(self):
+        """Drain plugin effects before workspace-wide cleanup or owner recovery."""
+        async with self._lock:
+            self._workloads_ready.clear()
+            try:
+                async with AsyncExitStack() as plugins:
+                    for lock in tuple(self._plugin_locks.values()):
+                        await plugins.enter_async_context(lock)
+                    yield
+            finally:
+                self._workloads_ready.set()
+
+    async def serve(self) -> None:
+        """Bind the private socket and serve one bounded request per connection."""
+
+        self._state_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_handle = self._state_path.with_suffix(".lock").open("a+", encoding="utf-8")
+        try:
+            fcntl.flock(lock_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            lock_handle.close()
+            raise RuntimeError("已有 Workload Controller 正在运行") from error
+        self._socket_path.parent.mkdir(parents=True, exist_ok=True)
+        server: asyncio.AbstractServer | None = None
+        listener: socket.socket | None = None
+        owned_socket: os.stat_result | None = None
+        try:
+            try:
+                stale_socket = self._socket_path.lstat()
+            except FileNotFoundError:
+                pass
+            else:
+                if not stat.S_ISSOCK(stale_socket.st_mode):
+                    raise RuntimeError(
+                        f"Controller socket path 已被非 socket 占用: {self._socket_path}"
+                    )
+                self._socket_path.unlink()
+            # Python 3.13+ can remove a Unix path on server.close(). Keep
+            # pathname ownership here so foreign replacements survive.
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            listener.bind(str(self._socket_path))
+            owned_socket = self._socket_path.lstat()
+            if sys.version_info >= (3, 13):
+                server = await asyncio.start_unix_server(
+                    self._accept, sock=listener, cleanup_socket=False
+                )
+            else:
+                server = await asyncio.start_unix_server(
+                    self._accept, sock=listener
+                )
+            listener = None
+            os.chmod(self._socket_path, 0o660)
+            socket_stat = self._socket_path.stat()
+            if (socket_stat.st_uid, socket_stat.st_gid) != (
+                self._socket_uid,
+                self._socket_gid,
+            ):
+                os.chown(self._socket_path, self._socket_uid, self._socket_gid)
+            # The listener is already serving. Close it after accepted requests
+            # finish; Server.__aexit__ and serve_forever wait for clients first.
+            stop = asyncio.Event()
+            if self._owner_container is None:
+                _ = await stop.wait()
+            else:
+                async with asyncio.TaskGroup() as tasks:
+                    _ = tasks.create_task(stop.wait(), name="workload-controller-server")
+                    _ = tasks.create_task(
+                        self._watch_owner(), name="workload-owner-watch"
+                    )
+        finally:
+            try:
+                if server is not None:
+                    self._closing = True
+                    server.close()
+                if listener is not None:
+                    listener.close()
+                requests = tuple(self._requests)
+                for request in requests:
+                    _ = request.cancel()
+                if self._image_operation is not None:
+                    self._image_operation.abort()
+                if requests:
+                    results = await asyncio.gather(*requests, return_exceptions=True)
+                else:
+                    results = []
+                if server is not None:
+                    await server.wait_closed()
+                if results:
+                    errors = [
+                        result for result in results
+                        if isinstance(result, BaseException)
+                        and not isinstance(result, asyncio.CancelledError)
+                    ]
+                    if errors:
+                        raise BaseExceptionGroup("Controller request shutdown failed", errors)
+                # 进程退出前证明精确租约清空，不能仅靠 Docker exit code。
+                async with self._maintenance():
+                    await self._stop_owned_workloads()
+                self._save_state(self._state_path.parent / "closed" / f"{self._controller_id}.json",
+                                 {"controller": {"id": self._controller_id, "leases_empty": True}})
+            finally:
+                try:
+                    if owned_socket is not None:
+                        try:
+                            current = self._socket_path.lstat()
+                        except FileNotFoundError:
+                            pass
+                        else:
+                            if (
+                                not stat.S_ISSOCK(current.st_mode)
+                                or (current.st_dev, current.st_ino)
+                                != (owned_socket.st_dev, owned_socket.st_ino)
+                            ):
+                                raise RuntimeError(
+                                    f"Controller socket path 已被替换: {self._socket_path}"
+                                )
+                            self._socket_path.unlink()
+                finally:
+                    fcntl.flock(lock_handle, fcntl.LOCK_UN)
+                    lock_handle.close()
+
+    def _accept(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        """Track accepted requests until shutdown has settled their effects."""
+
+        if self._closing:
+            writer.close()
+            return
+        request = asyncio.create_task(self._handle(reader, writer))
+        self._requests.add(request)
+
+        def finish(done: asyncio.Task[None]) -> None:
+            # A task cancelled before its first step never runs _handle's finally.
+            self._requests.discard(done)
+            writer.close()
+
+        request.add_done_callback(finish)
+
+    async def _watch_owner(self) -> None:
+        """Stop owned containers after the deployment owner disappears."""
+
+        loop = asyncio.get_running_loop()
+        while True:
+            try:
+                await self._check_owner(loop.time())
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Workload owner check failed; cleanup will retry")
+            await asyncio.sleep(self._owner_poll_seconds)
+
+    async def _check_owner(self, now: float) -> None:
+        """Apply one owner-liveness observation using the supplied monotonic time."""
+
+        owner = self._owner_container
+        if owner is None:
+            return
+        detail = await self._inspect(owner, allow_missing=True)
+        if detail is not None and _running(detail):
+            self._owner_seen_running = True
+            self._owner_missing_since = None
+            return
+
+        if self._owner_missing_since is None:
+            self._owner_missing_since = now
+        if (
+            not self._owner_seen_running
+            and now - self._owner_missing_since < self._owner_grace_seconds
+        ):
+            return
+
+        async with self._maintenance():
+            # Core may have restarted while this watcher waited for a request.
+            # Recheck under the same lock that guards start/adopt before cleanup.
+            detail = await self._inspect(owner, allow_missing=True)
+            if detail is not None and _running(detail):
+                self._owner_seen_running = True
+                self._owner_missing_since = None
+                return
+            await self._stop_owned_workloads()
+        self._owner_seen_running = False
+        self._owner_missing_since = now
+
+    async def _stop_owned_workloads(self) -> None:
+        """Strongly stop every exact lease still owned by this Controller."""
+
+        errors: list[Exception] = []
+        for raw in tuple(self._leases.values()):
+            try:
+                await _finish_effect(self._stop(_lease(raw)))
+            except Exception as error:
+                errors.append(error)
+        if errors:
+            raise ExceptionGroup("Workload owner cleanup 失败", errors)
+
+    async def _handle(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        try:
+            try:
+                self._check_peer(writer)
+                raw = await reader.readline()
+                if not raw or len(raw) > 1_048_576:
+                    raise ValueError("Controller 请求为空或过大")
+                message = json.loads(raw)
+                if not isinstance(message, dict) or message.get("version") != 1:
+                    raise ValueError("Controller 请求版本无效")
+                action = message.get("action")
+                body = message.get("body")
+                if not isinstance(body, dict):
+                    raise ValueError("Controller 请求 body 无效")
+                effect = self._dispatch(action, body)
+                # 镜像拉取可能很久：不屏蔽取消，控制器停止时要能中止它；其余效果仍先完成再响应取消。
+                result = await effect if action == "image_ensure" else await _finish_effect(effect)
+                response = {"ok": True, "body": result}
+            except Exception as error:
+                message = str(error).strip() or type(error).__name__
+                response = {"ok": False, "error": message[:4096]}
+                if isinstance(error, _NoResidualStart):
+                    response["residual"] = "none"
+            writer.write(
+                json.dumps(response, ensure_ascii=False, separators=(",", ":")).encode(
+                    "utf-8"
+                )
+                + b"\n"
+            )
+            await writer.drain()
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    async def _dispatch(self, action: object, body: dict[str, object]) -> dict[str, object]:
+        """Keep accepted effects ordered by plugin, with exclusive maintenance."""
+        if action == "status":
+            if body:
+                raise ValueError("Controller status 不接受参数")
+            return {"controller_id": self._controller_id, "leases": len(self._leases)}
+        if action == "start":
+            request = _start_request(body)
+            async with self._plugin_access(request.plugin_id):
+                try:
+                    return await self._start(request)
+                except Exception as error:
+                    if await self._start_left_nothing(request):
+                        raise _NoResidualStart(str(error).strip() or type(error).__name__) from error
+                    raise
+        if action == "stop":
+            if set(body) != {"lease"}:
+                raise ValueError("Controller stop schema 不匹配")
+            lease = _lease(body.get("lease"))
+            async with self._plugin_access(lease.plugin_id):
+                return await self._stop(lease)
+        if action == "image_ensure":
+            # 与启动 workload 同一条镜像引用规则（必须 sha256 digest 固定）；不占插件或维护锁，拉取期间其他请求照常处理。
+            if set(body) != {"image"}:
+                raise ValueError("Controller image_ensure schema 不匹配")
+            return await self._ensure_image(_required_text(body, "image"))
+        if action == "cleanup_candidates":
+            if set(body) != {"workspace_id"}:
+                raise ValueError("Controller cleanup schema 不匹配")
+            async with self._maintenance():
+                return await self._cleanup_candidates(_required_text(body, "workspace_id"))
+        raise ValueError(f"Controller action 无效: {action}")
+
+    # 确保镜像在本地：同一时间全局只允许一个（非阻塞：已有在途就立刻回"正在拉取"，不排队不等待）；
+    # 在专用单线程里做，不占默认线程池；整个过程有硬的总期限；取消（控制器停止）时主动中止，不等它完成。
+    async def _ensure_image(self, image: str) -> dict[str, object]:
+        if not _IMAGE.fullmatch(image):
+            raise ValueError("镜像必须使用 sha256 digest 固定")
+        if self._image_active is not None:
+            raise RuntimeError(f"正在拉取 {self._image_active}，稍后再试")
+        if self._image_survivor is not None and self._image_survivor.alive():
+            raise RuntimeError("上一次拉取仍未退出，稍后再试")
+        self._image_active = image
+        operation = _ImageOperation(self._engine.socket_path, _IMAGE_PULL_TIMEOUT_S, _IMAGE_INSPECT_TIMEOUT_S)
+        self._image_operation = operation
+        self._image_survivor = operation
+        # 每次操作一个新的单线程执行器：线程万一卡住，也不会拖住下一次请求；期限到了即使线程没回来，也在期限加宽限后返回失败。
+        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="image-ensure")
+        try:
+            future = asyncio.get_running_loop().run_in_executor(executor, operation.run, image)
+            return await asyncio.wait_for(future, timeout=_IMAGE_PULL_TIMEOUT_S + 5.0)
+        except asyncio.TimeoutError:
+            operation.abort()
+            raise RuntimeError(f"镜像操作超过 {_IMAGE_PULL_TIMEOUT_S:.0f} 秒的总期限，已中止") from None
+        except asyncio.CancelledError:
+            operation.abort()
+            raise
+        finally:
+            executor.shutdown(wait=False)
+            self._image_operation = None
+            self._image_active = None
+
+    # 启动失败后按稳定名核对现场；核对本身失败时不作结论，保持「结果未知」的保守语义。
+    async def _start_left_nothing(self, request: WorkloadStartRequest) -> bool:
+        try:
+            containers = await _finish_effect(self._find(request))
+        except Exception:
+            logger.exception("Workload start 失败后核对现场失败")
+            return False
+        return not containers and _lease_key(request) not in self._leases
+
+    def _check_peer(self, writer: asyncio.StreamWriter) -> None:
+        sock = writer.get_extra_info("socket")
+        if sock is None or not hasattr(socket, "SO_PEERCRED"):
+            raise PermissionError("Controller 无法验证 Unix peer")
+        raw = sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
+        _pid, uid, _gid = struct.unpack("3i", raw)
+        if uid != self._allowed_uid:
+            raise PermissionError(f"Controller peer uid 未授权: {uid}")
+
+    async def _start(self, request: WorkloadStartRequest) -> dict[str, object]:
+        self._check_request(request)
+        key = _lease_key(request)
+        containers = await self._find(request)
+        if len(containers) > 1:
+            raise RuntimeError(f"Workload stable key 出现多个容器: {key}")
+        adopted_from: str | None = None
+        if containers:
+            container = containers[0]
+            container_id = _text(container, "Id")
+            detail = await self._inspect(container_id)
+            assert detail is not None
+            labels = _labels(detail)
+            previous_raw = self._leases.get(key)
+            previous = _lease(previous_raw) if previous_raw is not None else None
+            if previous is not None and (
+                _lease_key(previous) != key or previous.container_id != container_id
+            ):
+                raise RuntimeError("已保存 Workload lease 与现有容器不一致")
+            if previous is not None and previous.spec_digest != request.spec_digest:
+                # A new generation may declare a new immutable spec. Replace only
+                # the exact Controller-owned lease; unrelated drift still fails.
+                self._check_lease_labels(previous, labels)
+                _ = await _finish_effect(self._stop(previous))
+                containers = []
+                container_id = await self._create(request)
+            else:
+                self._check_existing(request, detail, labels)
+                if not _running(detail):
+                    await self._start_existing(request, key, container_id)
+                adopted_from = (
+                    previous.generation_id
+                    if previous is not None
+                    else labels.get("com.cable.generation")
+                )
+        else:
+            container_id = await self._create(request)
+        lease = WorkloadLease(
+            workspace_id=request.workspace_id,
+            plugin_id=request.plugin_id,
+            workload=request.workload,
+            mode=request.mode,
+            transaction_id=request.transaction_id,
+            generation_id=request.generation_id,
+            container_id=container_id,
+            spec_digest=request.spec_digest,
+        )
+        if not containers:
+            self._leases[key] = asdict(lease)
+            self._save_leases()
+            try:
+                await _finish_effect(self._start_container(container_id))
+            except BaseException as start_error:
+                try:
+                    await asyncio.shield(self._stop(lease))
+                except BaseException as cleanup_error:
+                    raise BaseExceptionGroup(
+                        "Workload start 失败且 cleanup 未完成",
+                        [start_error, cleanup_error],
+                    )
+                raise
+        self._leases[key] = asdict(lease)
+        self._save_leases()
+        name = _container_name(request)
+        return {
+            "lease": asdict(lease),
+            "endpoints": [
+                {"name": port_name, "url": f"http://{name}:{number}"}
+                for port_name, number in request.ports
+            ],
+            "adopted_from_generation": adopted_from,
+        }
+
+    async def _stop(self, lease: WorkloadLease) -> dict[str, object]:
+        key = _lease_key(lease)
+        stop_key = _stop_key(lease)
+        saved = self._leases.get(key)
+        if saved != asdict(lease):
+            stopped = self._stopped.get(stop_key)
+            if not isinstance(stopped, dict) or stopped.get("lease") != asdict(lease):
+                raise RuntimeError("Workload stop lease 已过期或未 adopt")
+            sources_value = stopped.get("sources")
+            if not isinstance(sources_value, list) or any(
+                not isinstance(item, str) for item in sources_value
+            ):
+                raise RuntimeError("Workload completed stop state 损坏")
+            absent = await self._inspect(lease.container_id, allow_missing=True) is None
+            released = absent and not await self._active_mounts(tuple(sources_value))
+            if not absent or not released:
+                raise RuntimeError("Workload completed stop 证据已失效")
+            return _stop_receipt(lease)
+        detail = await self._inspect(lease.container_id, allow_missing=True)
+        saved_stop = self._stopped.get(stop_key)
+        saved_sources = (
+            saved_stop.get("sources") if isinstance(saved_stop, dict) else None
+        )
+        sources = (
+            tuple(cast(list[str], saved_sources))
+            if isinstance(saved_sources, list)
+            and all(isinstance(item, str) for item in saved_sources)
+            else ()
+        )
+        if detail is not None:
+            labels = _labels(detail)
+            self._check_lease_labels(lease, labels)
+            # 宿主出口目录由所有声明它的 Workload 共用，不算这个容器独占的 mount。
+            shared = None if self._host_egress_dir is None else str(self._host_egress_dir)
+            sources = tuple(
+                str(item.get("Source"))
+                for item in cast(list[dict[str, object]], detail.get("Mounts", []))
+                if item.get("Type") == "bind" and isinstance(item.get("Source"), str)
+                and item.get("Source") != shared
+            )
+            self._stopped[stop_key] = {
+                "lease": asdict(lease),
+                "sources": list(sources),
+                "complete": False,
+            }
+            self._save_state(self._stopped_path, self._stopped)
+            if _running(detail):
+                await self._engine.request(
+                    "POST",
+                    f"/containers/{quote(lease.container_id)}/stop?t=30",
+                    expected=frozenset({204, 304}),
+                )
+            await self._engine.request(
+                "DELETE",
+                f"/containers/{quote(lease.container_id)}?v=1",
+                expected=frozenset({204, 404}),
+            )
+        absent = await self._inspect(lease.container_id, allow_missing=True) is None
+        released = absent and not await self._active_mounts(sources)
+        if not absent or not released:
+            raise RuntimeError("Workload remove 后容器或 mount 仍被占用")
+        self._stopped[stop_key] = {
+            "lease": asdict(lease),
+            "sources": list(sources),
+            "complete": True,
+        }
+        self._save_state(self._stopped_path, self._stopped)
+        self._leases.pop(key, None)
+        self._save_leases()
+        return _stop_receipt(lease)
+
+    async def _cleanup_candidates(self, workspace_id: str) -> dict[str, object]:
+        """Remove only candidate containers from an earlier Core boot."""
+
+        if workspace_id != self._workspace_id:
+            raise ValueError("Workload cleanup workspace identity 不匹配")
+        labels = [
+            f"{_OWNER_LABEL}=true",
+            f"com.cable.workspace={workspace_id}",
+            "com.cable.workload.mode=candidate",
+        ]
+        filters = quote(json.dumps({"label": labels}, separators=(",", ":")))
+        value = await self._engine.request(
+            "GET",
+            f"/containers/json?all=1&filters={filters}",
+            expected=frozenset({200}),
+        )
+        if not isinstance(value, list) or any(
+            not isinstance(item, dict) for item in value
+        ):
+            raise RuntimeError("Docker candidate list 回执无效")
+        receipts: list[dict[str, object]] = []
+        for item in cast(list[dict[str, object]], value):
+            container_id = _text(item, "Id")
+            detail = await self._inspect(container_id)
+            assert detail is not None
+            item_labels = _labels(detail)
+            lease = _candidate_lease(workspace_id, container_id, item_labels)
+            key = _lease_key(lease)
+            saved = self._leases.get(key)
+            if saved is not None:
+                lease = _lease(saved)
+                if lease.container_id != container_id:
+                    raise RuntimeError("candidate lease container identity 不一致")
+            else:
+                self._leases[key] = asdict(lease)
+                self._save_leases()
+            receipts.append(await self._stop(lease))
+        return {"receipts": receipts}
+
+    async def _create(self, request: WorkloadStartRequest) -> str:
+        mounts = _docker_mounts(self._data_mounts(request))
+        labels = {
+            _OWNER_LABEL: "true",
+            "com.cable.workspace": request.workspace_id,
+            "com.cable.plugin": request.plugin_id,
+            "com.cable.workload.name": request.workload,
+            "com.cable.workload.mode": request.mode,
+            "com.cable.transaction": request.transaction_id,
+            "com.cable.generation": request.generation_id,
+            "com.cable.spec": request.spec_digest,
+        }
+        memory, cpu, pids = request.limits
+        docker_pids = None if pids == 0 else pids
+        body: dict[str, object] = {
+            "Image": request.image,
+            "User": f"{self._workload_uid}:{self._workload_gid}",
+            "Labels": labels,
+            "ExposedPorts": _exposed_ports(request),
+            "HostConfig": {
+                "Mounts": mounts,
+                "Memory": memory * 1024 * 1024,
+                "NanoCpus": int(cpu * 1_000_000_000),
+                "PidsLimit": docker_pids,
+                "NetworkMode": self._network,
+                "ExtraHosts": [_HOST_GATEWAY],
+                "PortBindings": _port_bindings(request),
+                "PublishAllPorts": False,
+                "PidMode": "",
+                "IpcMode": "private",
+                "UTSMode": "",
+                "UsernsMode": "",
+                "Devices": [],
+                "DeviceRequests": [],
+                "RestartPolicy": {"Name": "no", "MaximumRetryCount": 0},
+                "AutoRemove": False,
+                "Privileged": False,
+                "ReadonlyRootfs": False,
+                "CapDrop": ["ALL"],
+                "SecurityOpt": _security_options(request.user_namespaces),
+            },
+        }
+        if request.command:
+            body["Cmd"] = list(request.command)
+        try:
+            value = await _finish_effect(
+                self._engine.request(
+                    "POST",
+                    "/containers/create?"
+                    + urlencode({"name": _container_name(request)}),
+                    body=body,
+                    expected=frozenset({201}),
+                )
+            )
+        except asyncio.CancelledError:
+            containers = await _finish_effect(self._find(request))
+            if len(containers) == 1:
+                lease = _request_lease(request, _text(containers[0], "Id"))
+                self._leases[_lease_key(lease)] = asdict(lease)
+                self._save_leases()
+                await _finish_effect(self._stop(lease))
+            raise
+        except Exception:
+            containers = await _finish_effect(self._find(request))
+            if len(containers) == 1:
+                return _text(containers[0], "Id")
+            raise
+        if not isinstance(value, dict):
+            raise RuntimeError("Docker create 回执无效")
+        return _text(value, "Id")
+
+    async def _start_existing(
+        self,
+        request: WorkloadStartRequest,
+        key: str,
+        container_id: str,
+    ) -> None:
+        """Start an adopted container and keep cleanup ownership on failure."""
+
+        if key in self._leases:
+            await _finish_effect(self._start_container(container_id))
+            return
+        lease = WorkloadLease(
+            workspace_id=request.workspace_id,
+            plugin_id=request.plugin_id,
+            workload=request.workload,
+            mode=request.mode,
+            transaction_id=request.transaction_id,
+            generation_id=request.generation_id,
+            container_id=container_id,
+            spec_digest=request.spec_digest,
+        )
+        self._leases[key] = asdict(lease)
+        self._save_leases()
+        try:
+            await _finish_effect(self._start_container(container_id))
+        except BaseException as start_error:
+            try:
+                await asyncio.shield(self._stop(lease))
+            except BaseException as cleanup_error:
+                raise BaseExceptionGroup(
+                    "Workload adopt start 失败且 cleanup 未完成",
+                    [start_error, cleanup_error],
+                )
+            raise
+
+    async def _start_container(self, container_id: str) -> None:
+        await self._engine.request(
+            "POST",
+            f"/containers/{quote(container_id)}/start",
+            expected=frozenset({204, 304}),
+        )
+
+    async def _find(self, request: WorkloadStartRequest) -> list[dict[str, object]]:
+        labels = [
+            f"{_OWNER_LABEL}=true",
+            f"com.cable.workspace={request.workspace_id}",
+            f"com.cable.plugin={request.plugin_id}",
+            f"com.cable.workload.name={request.workload}",
+            f"com.cable.workload.mode={request.mode}",
+        ]
+        if request.mode == "candidate":
+            labels.append(f"com.cable.transaction={request.transaction_id}")
+        filters = quote(json.dumps({"label": labels}, separators=(",", ":")))
+        value = await self._engine.request(
+            "GET",
+            f"/containers/json?all=1&filters={filters}",
+            expected=frozenset({200}),
+        )
+        if not isinstance(value, list) or any(
+            not isinstance(item, dict) for item in value
+        ):
+            raise RuntimeError("Docker container list 回执无效")
+        return cast(list[dict[str, object]], value)
+
+    async def _inspect(
+        self,
+        container_id: str,
+        *,
+        allow_missing: bool = False,
+    ) -> dict[str, object] | None:
+        expected = frozenset({200, 404}) if allow_missing else frozenset({200})
+        value = await self._engine.request(
+            "GET",
+            f"/containers/{quote(container_id)}/json",
+            expected=expected,
+        )
+        if value is None:
+            return None
+        if not isinstance(value, dict):
+            raise RuntimeError("Docker inspect 回执无效")
+        return value
+
+    async def _active_mounts(self, sources: tuple[str, ...]) -> bool:
+        if not sources:
+            return False
+        filters = quote(json.dumps({"label": [f"{_OWNER_LABEL}=true"]}))
+        value = await self._engine.request(
+            "GET",
+            f"/containers/json?all=0&filters={filters}",
+            expected=frozenset({200}),
+        )
+        if not isinstance(value, list):
+            raise RuntimeError("Docker running container list 回执无效")
+        for item in value:
+            if not isinstance(item, dict):
+                raise RuntimeError("Docker running container entry 无效")
+            detail = await self._inspect(_text(item, "Id"))
+            assert detail is not None
+            for mount in cast(list[dict[str, object]], detail.get("Mounts", [])):
+                if mount.get("Source") in sources:
+                    return True
+        return False
+
+    def _data_mounts(
+        self,
+        request: WorkloadStartRequest,
+    ) -> tuple[tuple[str, str, bool], ...]:
+        data_root = _plugin_data_root(self._workspace, request)
+        result: list[tuple[str, str, bool]] = []
+        for name, target, writable in request.data:
+            source = data_root / name
+            _make_safe_dir(
+                self._workspace,
+                source,
+                uid=self._workload_uid,
+                gid=self._workload_gid,
+            )
+            result.append((str(source), target, writable))
+        # 宿主出口：挂整个目录而不是 socket 文件，Bridge 重启重建 socket 后容器里仍看得到新的。
+        if request.host_egress and self._host_egress_dir is not None:
+            self._host_egress_dir.mkdir(parents=True, exist_ok=True)
+            result.append((str(self._host_egress_dir), HOST_EGRESS_TARGET, False))
+        return tuple(result)
+
+    def _check_request(self, request: WorkloadStartRequest) -> None:
+        if request.workspace_id != self._workspace_id:
+            raise ValueError("Workload workspace identity 不匹配")
+        _safe_segment(request.plugin_id, "plugin_id")
+        if not _NAME.fullmatch(request.workload):
+            raise ValueError("Workload name 无效")
+        if request.mode not in {"candidate", "formal"}:
+            raise ValueError("Workload mode 无效")
+        if not request.transaction_id or not request.generation_id:
+            raise ValueError("Workload transaction/generation 不能为空")
+        if not _ID.fullmatch(request.transaction_id) or not _ID.fullmatch(
+            request.generation_id
+        ):
+            raise ValueError("Workload transaction/generation 无效")
+        if not _IMAGE.fullmatch(request.image):
+            raise ValueError("Workload image 必须使用 sha256 digest")
+        if not request.command:
+            raise ValueError("Workload command 不能为空")
+        if not isinstance(request.user_namespaces, bool):
+            raise ValueError("Workload user_namespaces 无效")
+        if not isinstance(request.host_egress, bool):
+            raise ValueError("Workload host_egress 无效")
+        if not request.ports or len({name for name, _ in request.ports}) != len(
+            request.ports
+        ):
+            raise ValueError("Workload ports 无效")
+        if len({number for _, number in request.ports}) != len(request.ports):
+            raise ValueError("Workload port number 重复")
+        for name, number in request.ports:
+            if not _NAME.fullmatch(name) or not 1 <= number <= 65535:
+                raise ValueError("Workload port 无效")
+        port_names = {name for name, _ in request.ports}
+        if len({name for name, _ in request.loopback_ports}) != len(
+            request.loopback_ports
+        ):
+            raise ValueError("Workload loopback port name 重复")
+        if len({number for _, number in request.loopback_ports}) != len(
+            request.loopback_ports
+        ):
+            raise ValueError("Workload loopback host port 重复")
+        for name, number in request.loopback_ports:
+            if name not in port_names or not 1024 <= number <= 65535:
+                raise ValueError("Workload loopback port 无效")
+        if len(set(request.udp_ports)) != len(request.udp_ports) or any(
+            not 1024 <= number <= 65535 for number in request.udp_ports
+        ):
+            raise ValueError("Workload udp port 无效")
+        if len({name for name, _, _ in request.data}) != len(request.data):
+            raise ValueError("Workload data name 重复")
+        if len({target for _, target, _ in request.data}) != len(request.data):
+            raise ValueError("Workload data target 重复")
+        for name, target, writable in request.data:
+            path = PurePosixPath(target)
+            if (
+                not _NAME.fullmatch(name)
+                or not path.is_absolute()
+                or path == PurePosixPath("/")
+                or ".." in path.parts
+                or not isinstance(writable, bool)
+            ):
+                raise ValueError("Workload data 无效")
+        health_port, health_path, health_timeout = request.health
+        if (
+            health_port not in {name for name, _ in request.ports}
+            or not health_path.startswith("/")
+            or health_path.startswith("//")
+            or health_path != health_path.strip()
+            or "\\" in health_path
+            or any(part in {".", ".."} for part in health_path.split("/"))
+            or urlsplit(health_path).query
+            or urlsplit(health_path).fragment
+            or not 0 < health_timeout <= 300
+        ):
+            raise ValueError("Workload health 无效")
+        memory, cpu, pids = request.limits
+        if not (
+            (memory == 0 or 64 <= memory <= 262_144)
+            and (cpu == 0 or 0.1 <= cpu <= 256)
+            and (pids == 0 or 16 <= pids <= 1_048_576)
+        ):
+            raise ValueError("Workload limits 超出允许范围")
+
+    def _check_existing(
+        self,
+        request: WorkloadStartRequest,
+        detail: dict[str, object],
+        labels: dict[str, str],
+    ) -> None:
+        expected = {
+            _OWNER_LABEL: "true",
+            "com.cable.workspace": request.workspace_id,
+            "com.cable.plugin": request.plugin_id,
+            "com.cable.workload.name": request.workload,
+            "com.cable.workload.mode": request.mode,
+            "com.cable.spec": request.spec_digest,
+        }
+        if any(labels.get(key) != value for key, value in expected.items()):
+            raise RuntimeError("已存在 Workload 与请求 spec/owner 不一致")
+        if (
+            request.mode == "candidate"
+            and labels.get("com.cable.transaction") != request.transaction_id
+        ):
+            raise RuntimeError("candidate Workload transaction 不一致")
+        memory, cpu, pids = request.limits
+        docker_pids = None if pids == 0 else pids
+        config = _object(detail, "Config")
+        host = _object(detail, "HostConfig")
+        expected_config: dict[str, object] = {
+            "Image": request.image,
+            "Cmd": list(request.command),
+            "User": f"{self._workload_uid}:{self._workload_gid}",
+            "ExposedPorts": _exposed_ports(request),
+        }
+        expected_host: dict[str, object] = {
+            "Memory": memory * 1024 * 1024,
+            "NanoCpus": int(cpu * 1_000_000_000),
+            "PidsLimit": docker_pids,
+            "NetworkMode": self._network,
+            "ExtraHosts": [_HOST_GATEWAY],
+            "PortBindings": _port_bindings(request),
+            "PublishAllPorts": False,
+            "PidMode": "",
+            "IpcMode": "private",
+            "UTSMode": "",
+            "UsernsMode": "",
+            "Devices": [],
+            "DeviceRequests": [],
+            "RestartPolicy": {"Name": "no", "MaximumRetryCount": 0},
+            "AutoRemove": False,
+            "Privileged": False,
+            "ReadonlyRootfs": False,
+            "CapDrop": ["ALL"],
+            "SecurityOpt": _security_options(request.user_namespaces),
+        }
+        if any(config.get(key) != value for key, value in expected_config.items()):
+            raise RuntimeError("已存在 Workload 的 image/command/user/ports 已漂移")
+        if any(host.get(key) != value for key, value in expected_host.items()):
+            raise RuntimeError(
+                "已存在 Workload 的 mount/limits/network/security 已漂移"
+            )
+        networks = _object(_object(detail, "NetworkSettings"), "Networks")
+        if set(networks) != {self._network}:
+            raise RuntimeError("已存在 Workload 的实际 network 已漂移")
+        mounts = detail.get("Mounts")
+        if not isinstance(mounts, list) or _mount_profile(mounts) != {
+            (source, target, writable)
+            for source, target, writable in self._data_mounts(request)
+        }:
+            raise RuntimeError("已存在 Workload 的实际 mount 已漂移")
+
+    @staticmethod
+    def _check_lease_labels(lease: WorkloadLease, labels: dict[str, str]) -> None:
+        expected = {
+            _OWNER_LABEL: "true",
+            "com.cable.workspace": lease.workspace_id,
+            "com.cable.plugin": lease.plugin_id,
+            "com.cable.workload.name": lease.workload,
+            "com.cable.workload.mode": lease.mode,
+            "com.cable.spec": lease.spec_digest,
+        }
+        if any(labels.get(key) != value for key, value in expected.items()):
+            raise RuntimeError("Workload stop owner/spec labels 不一致")
+
+    def _load_leases(self) -> dict[str, dict[str, object]]:
+        return self._load_state(self._state_path)
+
+    @staticmethod
+    def _load_state(path: Path) -> dict[str, dict[str, object]]:
+        if not path.exists():
+            return {}
+        value = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(value, dict) or any(
+            not isinstance(item, dict) for item in value.values()
+        ):
+            raise RuntimeError("Workload Controller lease state 损坏")
+        return cast(dict[str, dict[str, object]], value)
+
+    def _save_leases(self) -> None:
+        self._save_state(self._state_path, self._leases)
+
+    @staticmethod
+    def _save_state(path: Path, value: dict[str, dict[str, object]]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, raw_path = tempfile.mkstemp(
+            prefix=f".{path.name}.",
+            dir=path.parent,
+            text=True,
+        )
+        temp = Path(raw_path)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(value, handle, sort_keys=True, separators=(",", ":"))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp, path)
+            directory = os.open(
+                path.parent,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+            )
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        finally:
+            temp.unlink(missing_ok=True)
+
+
+def _start_request(raw: dict[str, object]) -> WorkloadStartRequest:
+    expected = {
+        "workspace_id",
+        "plugin_id",
+        "workload",
+        "mode",
+        "transaction_id",
+        "generation_id",
+        "spec_digest",
+        "image",
+        "command",
+        "ports",
+        "data",
+        "health",
+        "limits",
+        "loopback_ports",
+        "user_namespaces",
+        "udp_ports",
+        "host_egress",
+    }
+    if set(raw) != expected:
+        raise ValueError(f"Workload start schema 不匹配: {sorted(set(raw) ^ expected)}")
+    mode = _required_text(raw, "mode")
+    if mode not in {"candidate", "formal"}:
+        raise ValueError("Workload mode 无效")
+    request = WorkloadStartRequest(
+        workspace_id=_required_text(raw, "workspace_id"),
+        plugin_id=_required_text(raw, "plugin_id"),
+        workload=_required_text(raw, "workload"),
+        mode=cast(WorkloadMode, mode),
+        transaction_id=_required_text(raw, "transaction_id"),
+        generation_id=_required_text(raw, "generation_id"),
+        image=_required_text(raw, "image"),
+        command=_text_tuple(raw.get("command"), "command"),
+        ports=_ports(raw.get("ports")),
+        data=_data(raw.get("data")),
+        health=_health(raw.get("health")),
+        limits=_limits(raw.get("limits")),
+        loopback_ports=_ports(raw.get("loopback_ports")),
+        user_namespaces=_required_bool(raw, "user_namespaces"),
+        udp_ports=_udp_ports(raw.get("udp_ports")),
+        host_egress=_required_bool(raw, "host_egress"),
+    )
+    if _required_text(raw, "spec_digest") != request.spec_digest:
+        raise ValueError("Workload spec digest 与请求内容不一致")
+    return request
+
+
+def _security_options(user_namespaces: bool) -> list[str]:
+    """Keep Docker defaults unless a workload needs nested user namespaces."""
+
+    options = ["no-new-privileges"]
+    if user_namespaces:
+        options.append(_userns_seccomp_option())
+    return options
+
+
+@cache
+def _userns_seccomp_option() -> str:
+    """Load the Core-owned user-namespace exception to Docker's default profile."""
+
+    try:
+        profile = json.loads(_USERNS_SECCOMP_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError(
+            "Workload user namespace seccomp profile 无法加载"
+        ) from error
+    if not isinstance(profile, dict):
+        raise RuntimeError("Workload user namespace seccomp profile 必须是 JSON object")
+    return "seccomp=" + json.dumps(profile, separators=(",", ":"))
+
+
+def _exposed_ports(request: WorkloadStartRequest) -> dict[str, dict[str, str]]:
+    tcp: dict[str, dict[str, str]] = {f"{number}/tcp": {} for _, number in request.ports}
+    return tcp | {f"{number}/udp": {} for number in request.udp_ports}
+
+
+def _port_bindings(request: WorkloadStartRequest) -> dict[str, list[dict[str, str]]]:
+    """Publish formal TCP ports on loopback; UDP media ports keep their number on every host interface."""
+
+    if request.mode != "formal":
+        return {}
+    host_ports = dict(request.loopback_ports)
+    bindings = {
+        f"{number}/tcp": [{"HostIp": "127.0.0.1", "HostPort": str(host_ports[name])}]
+        for name, number in request.ports
+        if name in host_ports
+    }
+    return bindings | {
+        f"{number}/udp": [{"HostIp": "", "HostPort": str(number)}]
+        for number in request.udp_ports
+    }
+
+
+def _lease(raw: object) -> WorkloadLease:
+    if not isinstance(raw, dict):
+        raise ValueError("Workload lease 无效")
+    expected = {
+        "workspace_id",
+        "plugin_id",
+        "workload",
+        "mode",
+        "transaction_id",
+        "generation_id",
+        "container_id",
+        "spec_digest",
+    }
+    if set(raw) != expected:
+        raise ValueError(f"Workload lease schema 不匹配: {sorted(set(raw) ^ expected)}")
+    mode = _required_text(raw, "mode")
+    if mode not in {"candidate", "formal"}:
+        raise ValueError("Workload lease mode 无效")
+    return WorkloadLease(
+        workspace_id=_required_text(raw, "workspace_id"),
+        plugin_id=_required_text(raw, "plugin_id"),
+        workload=_required_text(raw, "workload"),
+        mode=cast(WorkloadMode, mode),
+        transaction_id=_required_text(raw, "transaction_id"),
+        generation_id=_required_text(raw, "generation_id"),
+        container_id=_required_text(raw, "container_id"),
+        spec_digest=_required_text(raw, "spec_digest"),
+    )
+
+
+def _candidate_lease(
+    workspace_id: str,
+    container_id: str,
+    labels: dict[str, str],
+) -> WorkloadLease:
+    expected = {
+        _OWNER_LABEL: "true",
+        "com.cable.workspace": workspace_id,
+        "com.cable.workload.mode": "candidate",
+    }
+    if any(labels.get(key) != value for key, value in expected.items()):
+        raise RuntimeError("candidate cleanup labels 不属于请求 workspace")
+    return WorkloadLease(
+        workspace_id=workspace_id,
+        plugin_id=_required_text(labels, "com.cable.plugin"),
+        workload=_required_text(labels, "com.cable.workload.name"),
+        mode="candidate",
+        transaction_id=_required_text(labels, "com.cable.transaction"),
+        generation_id=_required_text(labels, "com.cable.generation"),
+        container_id=container_id,
+        spec_digest=_required_text(labels, "com.cable.spec"),
+    )
+
+
+def _ports(raw: object) -> tuple[tuple[str, int], ...]:
+    if not isinstance(raw, list):
+        raise ValueError("Workload ports 无效")
+    result: list[tuple[str, int]] = []
+    for item in raw:
+        if (
+            not isinstance(item, (list, tuple))
+            or len(item) != 2
+            or not isinstance(item[0], str)
+            or not isinstance(item[1], int)
+            or isinstance(item[1], bool)
+        ):
+            raise ValueError("Workload port entry 无效")
+        result.append((item[0], item[1]))
+    return tuple(result)
+
+
+def _data(raw: object) -> tuple[tuple[str, str, bool], ...]:
+    if not isinstance(raw, list):
+        raise ValueError("Workload data 无效")
+    result: list[tuple[str, str, bool]] = []
+    for item in raw:
+        if (
+            not isinstance(item, (list, tuple))
+            or len(item) != 3
+            or not isinstance(item[0], str)
+            or not isinstance(item[1], str)
+            or not isinstance(item[2], bool)
+        ):
+            raise ValueError("Workload data entry 无效")
+        result.append((item[0], item[1], item[2]))
+    return tuple(result)
+
+
+def _udp_ports(raw: object) -> tuple[int, ...]:
+    if not isinstance(raw, list) or any(
+        not isinstance(item, int) or isinstance(item, bool) for item in raw
+    ):
+        raise ValueError("Workload udp ports 无效")
+    return tuple(raw)
+
+
+def _limits(raw: object) -> tuple[int, float, int]:
+    if (
+        not isinstance(raw, (list, tuple))
+        or len(raw) != 3
+        or not isinstance(raw[0], int)
+        or isinstance(raw[0], bool)
+        or not isinstance(raw[1], (int, float))
+        or isinstance(raw[1], bool)
+        or not isinstance(raw[2], int)
+        or isinstance(raw[2], bool)
+    ):
+        raise ValueError("Workload limits 无效")
+    return raw[0], float(raw[1]), raw[2]
+
+
+def _health(raw: object) -> tuple[str, str, float]:
+    if (
+        not isinstance(raw, (list, tuple))
+        or len(raw) != 3
+        or not isinstance(raw[0], str)
+        or not isinstance(raw[1], str)
+        or not isinstance(raw[2], (int, float))
+        or isinstance(raw[2], bool)
+    ):
+        raise ValueError("Workload health 无效")
+    return raw[0], raw[1], float(raw[2])
+
+
+def _plugin_data_root(workspace: Path, request: WorkloadStartRequest) -> Path:
+    if "@" in request.plugin_id:
+        name, marketplace = request.plugin_id.rsplit("@", 1)
+    else:
+        name, marketplace = request.plugin_id, "builtin"
+    _safe_segment(name, "plugin name")
+    _safe_segment(marketplace, "plugin marketplace")
+    dirname = f"{name}-{marketplace}"
+    if request.mode == "formal":
+        return workspace / "plugin-data" / dirname
+    return (
+        workspace
+        / "runtime"
+        / "plugin-validation"
+        / request.transaction_id
+        / "workspace"
+        / "plugin-data"
+        / dirname
+    )
+
+
+def _make_safe_dir(workspace: Path, target: Path, *, uid: int, gid: int) -> None:
+    try:
+        relative = target.relative_to(workspace)
+    except ValueError as error:
+        raise ValueError("Workload data path 越界") from error
+    current = workspace
+    for part in relative.parts:
+        current /= part
+        if current.is_symlink():
+            raise ValueError(f"Workload data path 穿过 symlink: {current}")
+        if not current.exists():
+            current.mkdir()
+            current_stat = current.stat()
+            if (current_stat.st_uid, current_stat.st_gid) != (uid, gid):
+                os.chown(current, uid, gid)
+        if not current.is_dir():
+            raise ValueError(f"Workload data path 不是目录: {current}")
+    stat = target.stat()
+    if (stat.st_uid, stat.st_gid) != (uid, gid):
+        raise ValueError(f"Workload data path owner 不匹配: {target}")
+
+
+def _container_name(value: WorkloadStartRequest) -> str:
+    key = _lease_key(value)
+    return "cable-w-" + hashlib.sha256(key.encode("utf-8")).hexdigest()[:20]
+
+
+def _lease_key(value: WorkloadStartRequest | WorkloadLease) -> str:
+    parts = [value.workspace_id, value.plugin_id, value.workload, value.mode]
+    if value.mode == "candidate":
+        parts.append(value.transaction_id)
+    return "|".join(parts)
+
+
+def _stop_key(lease: WorkloadLease) -> str:
+    encoded = json.dumps(asdict(lease), sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _stop_receipt(lease: WorkloadLease) -> dict[str, object]:
+    return {
+        "lease": asdict(lease),
+        "container_absent": True,
+        "mounts_released": True,
+    }
+
+
+def _request_lease(
+    request: WorkloadStartRequest,
+    container_id: str,
+) -> WorkloadLease:
+    return WorkloadLease(
+        workspace_id=request.workspace_id,
+        plugin_id=request.plugin_id,
+        workload=request.workload,
+        mode=request.mode,
+        transaction_id=request.transaction_id,
+        generation_id=request.generation_id,
+        container_id=container_id,
+        spec_digest=request.spec_digest,
+    )
+
+
+async def _finish_effect(effect: Coroutine[Any, Any, _T]) -> _T:
+    """Finish one Docker effect before restoring caller cancellation."""
+
+    return await shield_until_done(asyncio.create_task(effect))
+
+
+def _labels(detail: dict[str, object]) -> dict[str, str]:
+    config = detail.get("Config")
+    if not isinstance(config, dict) or not isinstance(config.get("Labels"), dict):
+        raise RuntimeError("Docker inspect 缺少 labels")
+    labels = config["Labels"]
+    if any(
+        not isinstance(key, str) or not isinstance(value, str)
+        for key, value in labels.items()
+    ):
+        raise RuntimeError("Docker labels 无效")
+    return cast(dict[str, str], labels)
+
+
+def _mount_profile(raw: list[object]) -> set[tuple[str, str, bool]]:
+    result: set[tuple[str, str, bool]] = set()
+    for item in raw:
+        if not isinstance(item, dict):
+            raise RuntimeError("Docker inspect mount 无效")
+        source = item.get("Source")
+        target = item.get("Destination")
+        writable = item.get("RW")
+        if (
+            item.get("Type") != "bind"
+            or not isinstance(source, str)
+            or not isinstance(target, str)
+            or not isinstance(writable, bool)
+        ):
+            raise RuntimeError("Docker inspect 出现未声明 mount")
+        result.add((source, target, writable))
+    return result
+
+
+def _docker_mounts(
+    data_mounts: tuple[tuple[str, str, bool], ...],
+) -> list[dict[str, object]]:
+    return [
+        {
+            "Type": "bind",
+            "Source": source,
+            "Target": target,
+            "ReadOnly": not writable,
+        }
+        for source, target, writable in data_mounts
+    ]
+
+
+def _running(detail: dict[str, object]) -> bool:
+    state = detail.get("State")
+    if not isinstance(state, dict) or not isinstance(state.get("Running"), bool):
+        raise RuntimeError("Docker inspect 缺少 running state")
+    return cast(bool, state["Running"])
+
+
+def _required_text(raw: Mapping[str, object], key: str) -> str:
+    value = raw.get(key)
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"Workload {key} 无效")
+    return value
+
+
+def _required_bool(raw: Mapping[str, object], key: str) -> bool:
+    value = raw.get(key)
+    if not isinstance(value, bool):
+        raise ValueError(f"Workload {key} 无效")
+    return value
+
+
+def _object(raw: Mapping[str, object], key: str) -> dict[str, object]:
+    value = raw.get(key)
+    if not isinstance(value, dict) or any(not isinstance(item, str) for item in value):
+        raise RuntimeError(f"Docker inspect {key} 无效")
+    return cast(dict[str, object], value)
+
+
+def _text_tuple(raw: object, label: str) -> tuple[str, ...]:
+    if not isinstance(raw, (list, tuple)) or any(
+        not isinstance(item, str) or not item for item in raw
+    ):
+        raise ValueError(f"Workload {label} 无效")
+    return tuple(raw)
+
+
+def _text(raw: dict[str, object], key: str) -> str:
+    return _required_text(raw, key)
+
+
+def _safe_segment(value: str, label: str) -> str:
+    if not isinstance(value, str) or not _SEGMENT.fullmatch(value):
+        raise ValueError(f"{label} 不是安全路径段: {value!r}")
+    return value
+
+
+async def main(arguments: tuple[str, ...], *, workspace: Path, config_path: Path) -> int:
+    parser = argparse.ArgumentParser(description="Cable Workload Controller")
+    parser.add_argument("--workspace", type=Path, default=workspace)
+    parser.add_argument("--socket", type=Path, required=True)
+    parser.add_argument(
+        "--docker-socket", type=Path, default=Path("/var/run/docker.sock")
+    )
+    parser.add_argument("--state", type=Path, required=True)
+    parser.add_argument("--network", required=True)
+    parser.add_argument("--allowed-uid", type=int, required=True)
+    parser.add_argument("--socket-gid", type=int, required=True)
+    parser.add_argument("--workload-uid", type=int, required=True)
+    parser.add_argument("--workload-gid", type=int, required=True)
+    parser.add_argument("--socket-uid", type=int, default=0)
+    parser.add_argument("--owner-container")
+    parser.add_argument("--owner-grace-seconds", type=float, default=10.0)
+    parser.add_argument("--owner-poll-seconds", type=float, default=2.0)
+    parser.add_argument("--host-egress-dir", type=Path)
+    args = parser.parse_args(arguments)
+    server = WorkloadControllerServer(
+        workspace=args.workspace,
+        socket_path=args.socket,
+        docker_socket=args.docker_socket,
+        state_path=args.state,
+        network=args.network,
+        allowed_uid=args.allowed_uid,
+        socket_gid=args.socket_gid,
+        workload_uid=args.workload_uid,
+        workload_gid=args.workload_gid,
+        socket_uid=args.socket_uid,
+        owner_container=args.owner_container,
+        owner_grace_seconds=args.owner_grace_seconds,
+        owner_poll_seconds=args.owner_poll_seconds,
+        host_egress_dir=args.host_egress_dir,
+    )
+    await _serve_until_signal(server)
+    return 0
+
+
+async def _serve_until_signal(server: WorkloadControllerServer) -> None:
+    """Turn process SIGTERM into the server's ordinary cancellation path."""
+
+    loop = asyncio.get_running_loop()
+    serving = asyncio.create_task(server.serve())
+
+    def stop() -> None:
+        _ = loop.remove_signal_handler(signal.SIGTERM)
+        _ = serving.cancel()
+
+    loop.add_signal_handler(signal.SIGTERM, stop)
+    try:
+        await serving
+    except asyncio.CancelledError:
+        if not serving.cancelled():
+            raise
+    finally:
+        _ = loop.remove_signal_handler(signal.SIGTERM)
+
+
+if __name__ == "__main__":
+    raise SystemExit(asyncio.run(main(tuple(sys.argv[1:]), workspace=Path.cwd(), config_path=Path.cwd() / "config.toml")))

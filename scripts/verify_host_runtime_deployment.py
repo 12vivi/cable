@@ -1,0 +1,132 @@
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import subprocess
+import os
+import sys
+from pathlib import Path
+
+_SOURCE_ROOT = Path(__file__).resolve().parents[1]
+if str(_SOURCE_ROOT) not in sys.path:
+    sys.path.insert(0, str(_SOURCE_ROOT))
+
+from scripts.host_toolchain_identity import resolve_toolchain_identity
+
+
+def verify_deployment_image(release_manifest: Path, image: str) -> str:
+    """Verify the exact local Docker image selected by a release manifest."""
+
+    if re.fullmatch(r"sha256:[0-9a-f]{64}", image) is None:
+        raise RuntimeError("部署必须使用完整 content-addressed image ID")
+    release = json.loads(release_manifest.read_text(encoding="utf-8"))
+    schema_version = release.get("schemaVersion")
+    if schema_version not in {1, 2} or release.get("imageId") != image:
+        raise RuntimeError("部署 image 与 release manifest 不一致")
+    if schema_version == 2 and not isinstance(release.get("runtimeInfo"), dict):
+        raise RuntimeError("distribution release manifest 缺少 runtimeInfo")
+    actual = subprocess.run(
+        ["docker", "image", "inspect", image, "--format", "{{.Id}}"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    if actual != image:
+        raise RuntimeError(f"Docker Engine image identity 不一致: {actual}")
+    return actual
+
+
+def verify_host_toolchain_deployment(
+    release_manifest: Path,
+    runtime_checkout: Path,
+    mise: Path,
+    bridge_python: Path,
+    expected_digest: str,
+) -> dict[str, object]:
+    """Prove the Bridge checkout, tools, interpreter, and imported source match release."""
+
+    # 1. Recompute the target host toolchain instead of trusting runtime.env.
+    release = json.loads(release_manifest.read_text(encoding="utf-8"))
+    expected = release.get("hostToolchainIdentity")
+    actual = resolve_toolchain_identity(runtime_checkout, mise)
+    if expected != actual or actual.get("toolchainDigest") != expected_digest:
+        raise RuntimeError("Host Bridge toolchain 与 release manifest 不一致")
+
+    # 2. Verify the selected Python and agent module are the declared generation.
+    bridge_python = bridge_python.absolute()
+    if not bridge_python.is_file() or not os.access(bridge_python, os.X_OK):
+        raise RuntimeError("Host Bridge Python 不存在或不可执行")
+    python_version = subprocess.run(
+        [str(bridge_python), "--version"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    declared_python = str(actual["tools"]["python"])
+    if declared_python not in python_version:
+        raise RuntimeError("Host Bridge Python 与 mise contract 不一致")
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(runtime_checkout.resolve(strict=True))
+    module_path = subprocess.run(
+        [
+            str(bridge_python),
+            "-c",
+            "from pathlib import Path; import plugins.host_execution.bridge.server as m; "
+            "print(Path(m.__file__).resolve())",
+        ],
+        cwd=runtime_checkout,
+        env=environment,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    expected_module = str(
+        (runtime_checkout / "plugins" / "host_execution" / "bridge" / "server.py").resolve(strict=True)
+    )
+    if module_path != expected_module:
+        raise RuntimeError("Host Bridge module 未从 release checkout 加载")
+    return actual
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Verify an Cable release image")
+    parser.add_argument("--release-manifest", type=Path, required=True)
+    parser.add_argument("--image")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--host-only", action="store_true")
+    # Core 单元 Requires/PartOf Host Bridge，Bridge 启动前已核对同一份宿主工具链。
+    mode.add_argument("--image-only", action="store_true")
+    parser.add_argument("--runtime-checkout", type=Path)
+    parser.add_argument("--mise", type=Path)
+    parser.add_argument("--bridge-python", type=Path)
+    parser.add_argument("--expected-toolchain-digest")
+    args = parser.parse_args()
+    identity: dict[str, object] | None = None
+    if not args.image_only:
+        if None in (args.runtime_checkout, args.mise, args.bridge_python, args.expected_toolchain_digest):
+            parser.error("host toolchain arguments are required unless --image-only is set")
+        identity = verify_host_toolchain_deployment(
+            args.release_manifest,
+            args.runtime_checkout,
+            args.mise,
+            args.bridge_python,
+            args.expected_toolchain_digest,
+        )
+    image: str | None = None
+    if not args.host_only:
+        if args.image is None:
+            parser.error("--image is required unless --host-only is set")
+        image = verify_deployment_image(args.release_manifest, args.image)
+    print(
+        json.dumps(
+            {
+                "imageId": image,
+                "hostToolchainIdentity": identity,
+            }
+        )
+    )
+
+
+if __name__ == "__main__":
+    main()
