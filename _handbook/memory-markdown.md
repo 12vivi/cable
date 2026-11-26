@@ -17,15 +17,31 @@
 
 ## 后台提炼
 
-Output 引用压缩摘要后，follower 读取尚未学习的完整 Turn，把当前 `SELF.md`、`MEMORY.md`、全局主题与本 scope
-文件夹全文交给模型，模型只返回操作：`add`、`supersede`、`retract`、`create`、`create_folder`。
+两个时机，任一先到都会把尚未学习的完整 Turn 连同当前 `SELF.md`、`MEMORY.md`、全局主题与本 scope 文件夹全文交给模型，
+模型只返回操作：`add`、`supersede`、`retract`、`create`、`create_folder`。
+
+- **会话停下后**（[0167](../docs/decisions/0167-markdown-memory-learns-when-idle.md)）：空闲巡检每分钟看一次，会话停下
+  `extract_idle_minutes`（默认 30，`0` 关闭）后，提炼已闭合、可学习、还没学过的完整 Turn，来源记为 `idle:<会话>:<最后一条消息>`。
+  只补学最近 7 天还有对话的会话；连续失败 3 次的空闲来源记为已处理，原消息保留。
+- **Output 引用压缩摘要后**：follower 读取摘要覆盖、尚未学习的完整 Turn。
+- 两条路径在同一把更新锁内各自重读“已学过”：空闲路径的操作与它覆盖的消息同一事务记入 `idle_learned`，摘要路径据此跳过；
+  空闲路径跳过已应用摘要覆盖的消息（因放不下而被摘要省略的，按 MEM-011 也不恢复资格）。同一 Turn 只学一次。
+
+提炼规则：
 
 - 证据：每个操作引用本次来源的真实 message_id；`MEMORY.md`、`SELF.md` 中对用户与关系的判断及 `retract` 只认用户 Input。
-- 新条目为不超过 120 字的非空单行 `- ` 文本；旧状态推进或事实变化时优先用 `supersede` 原地更新，对环境、部署、套餐等易随时间漂移的客观事实在有明确时间时保留确认日期锚点（整理与剪枝亦保留原有确认日期，不编造日期），不记录未执行的待办议程。既有档案或新提炼结果超额时，先按 MEM-014 剪枝回配额内，再提交；其他手写章节不参与剪枝。不合格草稿修正一次。
-- 只能写全局主题或当前 scope 的文件夹；后台不设置 `pinned`。
+  Cable 答应用户的事可以引用 Cable 自己的回复，写进主题。
+- 记什么：用户事实（身份、处境、生活里重要的人和事）；对 Cable 说话方式、做事方式的反馈——纠正和明确认可都记，
+  写成以后怎么做并带原因，通用的进 `MEMORY.md`「用户偏好」；用户的计划、日程与约定；外部资源的去处；以及耗费多步才定位的陷阱
+  与经实测验证的规则。证据不足不记；密码、密钥、证件号、银行卡与账户号码不记（最多记存放位置）；健康、宗教、政治倾向等
+  私密信息只在用户明确要求时记。
+- 时间：每条来源消息附带接纳时的本地时间与星期（`at`），条目里的“明天”“下周三”等相对时间按它换算成具体日期再写。
+- 新条目为不超过 120 字的非空单行 `- ` 文本；旧状态推进或事实变化时优先用 `supersede` 原地更新，对环境、部署、套餐等易随时间漂移的客观事实在有明确时间时保留确认日期锚点（整理与剪枝亦保留原有确认日期，不编造日期），不记录会话内的待办清单。既有档案或新提炼结果超额时，先按 MEM-014 剪枝回配额内，再提交；其他手写章节不参与剪枝。不合格草稿修正一次。
+- 只能写全局主题或当前 scope 的文件夹；后台不设置 `pinned`。主题文件名用小写字母、数字、连字符或汉字；
+  文件名不合规的主题照常作为参照，但在提炼提示里标为只读。
 
 ```
-compaction summary used by Output
+compaction summary used by Output，或会话停下 extract_idle_minutes
   → markdown_ops_v1（操作 draft，按 source_ref 幂等）
   → 文件锁内叠加到当前文件（幂等收敛：已存在跳过、旧条目不在则 noop、同 scope 已有文件夹则重定向）
   → markdown_before_v1（首次叠加前内容）+ markdown_ops_applied_v1
@@ -33,7 +49,7 @@ compaction summary used by Output
 
 叠加作用于锁内读到的当前文件；替换前再比对一次读到的内容，变化则重读重叠加，3 次仍变化就保留 draft 待下次重试。
 重放时前提已失效的操作（scope 文件夹不在、supersede 新旧条目都不在、主题文件已删除）跳过，写入 applied receipt 的 `conflicts` 并记日志。
-操作 draft 与会话进度同一事务提交；缺少进度的提炼 draft 拒绝应用。崩溃后启动时重放未确认的 draft。
+操作 draft 与会话进度（摘要路径的顺序 receipt，或空闲路径的已学消息）同一事务提交；缺少进度的提炼 draft 拒绝应用。崩溃后启动时重放未确认的 draft。
 
 已知限制：原生 `write_file` / `edit_file`、shell 与外部编辑器不参与后台的文件锁。比对与替换之间、以及原生工具自身读写之间仍有
 很小的竞争窗口，极少数并发下可能静默丢失一条记忆；为此提示 agent 对已有记忆文件只用 `edit_file`。
@@ -42,7 +58,7 @@ compaction summary used by Output
 ## 注入与 agent 写入
 
 system 材料按"会话 + 最新压缩摘要"冻结：同一压缩代内前缀不变，agent 或后台写入在下一次压缩或新会话中可见。内容依次为：
-使用规则（记忆目录绝对路径、读写方式、易变信息先核实）→ `SELF.md` → `MEMORY.md` → 当前项目文件夹的 pinned 全文与索引 →
+使用规则（记忆目录绝对路径、读写方式、记什么与时间写法、易变信息先核实、回忆时找不到依据就直说记不清）→ `SELF.md` → `MEMORY.md` → 当前项目文件夹的 pinned 全文与索引 →
 全局主题的 pinned 全文与索引 → 其他项目文件夹清单（不加载，需要时 `rg`）。索引由 frontmatter `description` 自动生成；
 pinned 每组 4000 字，超出截断并提示。不属于项目的会话没有项目段。
 
@@ -50,9 +66,19 @@ agent 用原生 `read_file` / `write_file` / `edit_file` / `shell rg` 读写记�
 
 ## 每轮浮现
 
-每条新的用户 Input 首次准备材料时，用 BM25（ASCII 词 + 中文二元组）对当前项目文件夹与全局主题中**未 pinned** 的文件排序，
-得分不低于 `surface_min_score`（默认 2.0）的前 `surface_limit`（默认 3，0 关闭）个以可回放 reminder 附在本轮，
-标注"N 天前更新"，单文件最多 `surface_chars` 字。同一 Input 的后续工具步骤复用结果（跨重启则从该 Input 已提交的 Output 恢复）；当前未进入压缩摘要的已提交 Output 中已浮现过的主题不重复浮现，未提交 Output 的中断轮次不占用浮现名额。不改变 system 前缀。
+每条新的用户 Input 首次准备材料时，对当前项目文件夹与全局主题中**未 pinned** 的文件按两路排序
+（[0167](../docs/decisions/0167-markdown-memory-learns-when-idle.md)）：
+
+- 关键词：BM25（ASCII 词 + 中文二元组，去掉“怎么”“需要”等常见停用词），至少命中两个不同的词且得分不低于
+  `surface_min_score`（默认 2.0）才过线。
+- 向量（有 embedding provider 时）：每篇按“文件名 + description”与每条 `- ` 条目分别向量化，按空间与正文摘要缓存在
+  `markdown-profile-writes.db`（60 天未用清理，损坏报错不当缺失）。余弦相似度换成相对本次查询无关水平
+  （全部条目与固定参照句的中位数）的相关度 `(s - 基线) / max(1 - 基线, 0.5)`，不低于 `surface_min_relevance`（默认 0.3）才过线。
+  每轮最多新算 32 条向量；embedding 不可用或请求失败时记一次降级日志、只用关键词（MEM-006）。
+
+两路名次按 RRF 融合，取前 `surface_limit`（默认 3，0 关闭）个，按内联链接补足，以可回放 reminder 附在本轮，标注"N 天前更新"
+与 description。每篇只给最相关的至多 6 条条目（按原文顺序，单篇最多 `surface_chars` 字），其余提示用 `read_file` 读取；
+没有条目的散文按原文截断展示。同一 Input 的后续工具步骤复用结果（跨重启则从该 Input 已提交的 Output 恢复）；当前未进入压缩摘要的已提交 Output 中已浮现过的主题不重复浮现，未提交 Output 的中断轮次不占用浮现名额。不改变 system 前缀。
 
 ## 整理
 
