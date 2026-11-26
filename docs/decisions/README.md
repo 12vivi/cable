@@ -6,6 +6,7 @@
 
 | ID | 状态 | 主题 | 关联条款 |
 |---|---|---|---|
+| [0167](0167-markdown-memory-learns-when-idle.md) | proposed / implemented for review | Markdown 记忆：对话停下后提炼，提炼规则参考四类记忆，主题按关键词与向量两路浮现 | MEM-002、MEM-006、MEM-011、MEM-012 |
 | [0151](0151-watch-closes-every-loop.md) | proposed / implemented for review | 值班：每件事要有着落，来源可以是一个脚本 | PRO-004～PRO-006 |
 | [0152](0152-watch-speaks-at-the-right-moment.md) | proposed / implemented for review | 值班：话留到合适的时刻说，聊天里先回应 | PRO-004～PRO-006 |
 | [0153](0153-watch-panel.md) | proposed / implemented for review | 值班面板：从已有记录现读，只认识来源和事件 | PRO-005 |

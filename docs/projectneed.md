@@ -515,7 +515,9 @@ Core 只保存和比较 scope，不解释维度含义。每个维度必须有唯
 
 ### MEM-002 Markdown 记忆按 checkpoint 直接且独立提交
 
-Included compaction checkpoint 是 Markdown 新事实的自动提炼来源；既有条目的去重整理和 MEM-014 超额剪枝可独立触发。MEMORY 与 SELF 分别按
+Markdown 新事实的自动提炼有两个来源：included compaction checkpoint，以及会话停下 `extract_idle_minutes`
+（默认 30 分钟，0 关闭）后尚未学过的已闭合完整 Turn（[0167](decisions/0167-markdown-memory-learns-when-idle.md)）；
+同一 Turn 只由其中一条路径学习一次。既有条目的去重整理和 MEM-014 超额剪枝可独立触发。MEMORY 与 SELF 分别按
 `source_ref + kind` 幂等提交；一份失败不得伪装另一份成功，也不得回滚 Session ledger。
 每次替换前先保留恢复点，并以校验、fsync 和原子 replace 发布。旧非空 PENDING 只允许在
 带备份和 receipt 的一次性迁移中合并，在线 runtime 不再创建或消费 PENDING。
@@ -573,7 +575,8 @@ CTX-007 的安全工具批次切分，20,000 token 是近期原文目标。每�
 `message_push`、schedule fire 和 spawn completion assistant 若属于独立 source，仍拥有
 原归属。Markdown 不学习累计摘要覆盖尚未到达结束边界的 Turn；后续覆盖完整闭合后，
 按父链的真实摘要输入补学被延后的尾部，已完整应用的 Turn 不重复学习，省略资料不
-因此恢复资格。runtime 不再使用
+因此恢复资格。空闲提炼只学已闭合的完整 Turn，与摘要路径共用“已学过”判定：已应用摘要覆盖的消息
+（含被摘要省略的）不再空闲提炼，空闲已学的消息不再随摘要重复学习。runtime 不再使用
 `memory_window`；临时请求切点不得改变 Message、Turn 或学习资格。
 
 ### MEM-012 Markdown 新用户事实必须有用户原文证据
